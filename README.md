@@ -23,11 +23,12 @@ measured in real matches.
 | Mac | MacBook Air 15-inch (M4, 2025), fanless |
 | Chip | Apple M4: 10-core CPU (4 performance + 6 efficiency cores), 10-core GPU |
 | Memory | 24 GB |
-| Display | built-in 2880 × 1864 |
+| Display | built-in 2880 × 1864 panel |
+| Game resolution | 1710 × 1068 (DLSS Performance: rendered at 855 × 534, upscaled to 1710 × 1068) |
 | macOS | 27.0.1 |
 | Cooling | **thermal-pad mod** (thermal pads that let the chassis take more heat from the chip) |
 
-On this Mac, with DLSS Performance and low graphics settings: 60 fps (the cap) in early fights, around 50 fps in
+On this Mac, at 1710 × 1068 with DLSS Performance and low graphics settings: 60 fps (the cap) in early fights, around 50 fps in
 late-game fights once the Air heats up. A fanless Air slows its CPU when the case gets warm, so an unmodified Air
 will drop sooner; a Mac with a fan (MacBook Pro, Mac mini, Mac Studio) holds its speed much longer.
 
