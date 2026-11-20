@@ -25,6 +25,11 @@ STEAM_SETUP_URL="https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.
 # -dx11: the Vulkan renderer would go through MoltenVK; DX11 goes through DXMT (Direct3D 11 on Metal).
 # -condebug: the console goes to game/citadel/console.log (bug reports).
 if [[ -n ${DEADLOCK_ARGS:-} ]]; then DEADLOCK_ARGS=(${=DEADLOCK_ARGS}); else DEADLOCK_ARGS=(-dx11 -novid -condebug); fi
+# +v8_jitless 1: the game's UI (Panorama) runs its JavaScript in V8's interpreter instead of compiling it to x86 code
+# at runtime, which Rosetta/FEX would have to translate again (and again after every recompile). The UI is light,
+# so the interpreter costs little; in matches the main thread had clearly more room. A launch option, not a file
+# change. DL_V8_JIT=1 keeps V8's JIT.
+(( ${DL_V8_JIT:-0} )) || DEADLOCK_ARGS+=(+v8_jitless 1)
 # Steam's own windows (CEF) render through an app-local DXVK; -silent: no window until needed
 if [[ -n ${STEAM_ARGS:-} ]]; then STEAM_ARGS=(${=STEAM_ARGS}); else STEAM_ARGS=(-silent -nofriendsui); fi
 

@@ -141,6 +141,9 @@ which hides newer heroes until you quit the game; start a normal match from a fr
 - With Bluetooth headphones, the Mac's default microphone switches to the built-in one when the game starts: Deadlock
   always opens the default microphone for voice chat, and a headset whose own microphone is in use drops to call
   quality (mono, muffled). `DL_BT_MIC=1` keeps the headset's microphone.
+- The game starts with `+v8_jitless 1`: its interface scripts run without generating machine code at runtime, which
+  Rosetta would otherwise have to translate again and again. A launch option, no file change; `DL_V8_JIT=1` turns it
+  off.
 - Nothing is installed into the system, and `/Applications/Steam.app` is not modified.
 
 ## Troubleshooting
