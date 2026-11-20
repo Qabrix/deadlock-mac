@@ -1,0 +1,22 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 94e7ebec6..934c0f6e5 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -345,6 +345,17 @@ DEF_OP(RDRAND) {
+ }
+ 
+ DEF_OP(Yield) {
++#ifdef DL_PAUSE_WFET
++  // deadlock-gptk: x86 PAUSE spins (Source 2's job threads spin for a bounded TSC time before sleeping) as a short
++  // timed wait instead of ARM's yield hint, which is a nop: the core idles for up to DL_PAUSE_WFET ticks of the
++  // 24 MHz counter (~42 ns each, about one PAUSE on recent Intel cores) instead of spinning at full power.
++  if (CTX->HostFeatures.SupportsWFXT) {
++    mrs(TMP1, ARMEmitter::SystemRegister::CNTVCT_EL0);
++    add(ARMEmitter::Size::i64Bit, TMP1, TMP1, DL_PAUSE_WFET);
++    wfet(TMP1);
++    return;
++  }
++#endif
+   yield();
+ }
+ 

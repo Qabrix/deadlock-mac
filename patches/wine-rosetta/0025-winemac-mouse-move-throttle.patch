@@ -1,0 +1,351 @@
+diff --git a/dlls/winemac.drv/cocoa_app.h b/dlls/winemac.drv/cocoa_app.h
+index ff7c243..5e2e80e 100644
+--- a/dlls/winemac.drv/cocoa_app.h
++++ b/dlls/winemac.drv/cocoa_app.h
+@@ -71,6 +71,7 @@ @interface WineApplicationController : NSObject <NSApplicationDelegate>
+     WineWindow* mouseCaptureWindow;
+     BOOL forceNextMouseMoveAbsolute;
+     double mouseMoveDeltaX, mouseMoveDeltaY;
++    int rawMouseSignX, rawMouseSignY; /* deadlock-gptk: WINE_MAC_RAW_MOUSE sign per axis (0 = not learned yet -> +1) */
+     NSUInteger unmatchedMouseDowns;
+ 
+     NSTimeInterval lastScrollTime;
+diff --git a/dlls/winemac.drv/cocoa_app.m b/dlls/winemac.drv/cocoa_app.m
+index c57ca47..906c493 100644
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -18,6 +18,10 @@
+  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+  */
+ 
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #import "cocoa_app.h"
+ #import "cocoa_cursorclipping.h"
+ #import "cocoa_event.h"
+@@ -50,6 +54,79 @@
+ static NSString* const WineExternalQuitRequestNotification = @"WineExternalQuitRequestNotification";
+ static NSString* const WineExternalQuitNotificationAUMIDKey = @"AUMID";
+ static NSString* const WineExternalQuitNotificationExeNameKey = @"ExeName";
++
++/* deadlock-gptk: WINE_MAC_RAW_MOUSE=<scale> (e.g. 1) sends relative (captured-cursor) mouse motion from the
++ * device's unaccelerated movement (kCGEventUnacceleratedPointerMovementX/Y) times <scale>, like Windows raw
++ * input, instead of NSEvent deltas that carry macOS pointer acceleration and speed. The sign per axis is
++ * taken from the accelerated delta whenever both are non-zero. WINE_MAC_MOUSE_STATS=<unix path> appends
++ * per-2-second mouse statistics there (events, warp drops, relative/absolute, accelerated vs raw motion). */
++/* deadlock-gptk: WINE_MAC_RELATIVE_LOOK=1 - while the client hides the cursor and clips it (mouse-look), every move
++ * is sent as relative motion with sub-pixel remainders kept: no forced absolute move after the client re-centres the
++ * cursor, and moves around a re-centre are not discarded (they are real device motion). Stock behaviour sends
++ * absolute, floor()ed positions whenever the cursor is inside its clip rect, which turns every re-centre into a jump. */
++static int relative_look(void)
++{
++    static int on = -1;
++    if (on < 0)
++    {
++        const char *s = getenv("WINE_MAC_RELATIVE_LOOK");
++        on = s && *s == '1';
++    }
++    return on;
++}
++
++static double raw_mouse_scale(void)
++{
++    static double scale = -1;
++    if (scale < 0)
++    {
++        const char *s = getenv("WINE_MAC_RAW_MOUSE");
++        scale = s && *s ? atof(s) : 0;
++        if (scale < 0) scale = 0;
++    }
++    return scale;
++}
++
++static struct
++{
++    FILE *f;
++    double t0;
++    unsigned events, warp_drops, abs_posted, rel_posted, rel_zero;
++    double acc_slow, raw_slow, acc_fast, raw_fast;
++    unsigned n_slow, n_fast;
++} mouse_stats;
++
++static void mouse_stats_tick(double now)
++{
++    static int init;
++    if (!init)
++    {
++        const char *p = getenv("WINE_MAC_MOUSE_STATS");
++        init = 1;
++        if (p && *p) mouse_stats.f = fopen(p, "a");
++        mouse_stats.t0 = now;
++    }
++    if (!mouse_stats.f || now - mouse_stats.t0 < 2.0) return;
++    if (mouse_stats.events)
++    {
++        double d = now - mouse_stats.t0;
++        fprintf(mouse_stats.f, "%.0f ev/s %.0f | warp-dropped %u | posted abs %u rel %u (zero %u) | "
++                "slow: acc/raw %.3f (n %u, raw %.2f/ev) | fast: acc/raw %.3f (n %u, raw %.2f/ev)\n",
++                mouse_stats.events / d, d, mouse_stats.warp_drops, mouse_stats.abs_posted,
++                mouse_stats.rel_posted, mouse_stats.rel_zero,
++                mouse_stats.raw_slow > 0 ? mouse_stats.acc_slow / mouse_stats.raw_slow : 0, mouse_stats.n_slow,
++                mouse_stats.n_slow ? mouse_stats.raw_slow / mouse_stats.n_slow : 0,
++                mouse_stats.raw_fast > 0 ? mouse_stats.acc_fast / mouse_stats.raw_fast : 0, mouse_stats.n_fast,
++                mouse_stats.n_fast ? mouse_stats.raw_fast / mouse_stats.n_fast : 0);
++        fflush(mouse_stats.f);
++    }
++    {
++        FILE *f = mouse_stats.f;
++        memset(&mouse_stats, 0, sizeof(mouse_stats));
++        mouse_stats.f = f;
++        mouse_stats.t0 = now;
++    }
++}
+ static NSString* const WineExternalQuitNotificationSourcePIDKey = @"SourcePID";
+ static NSString* const WineExternalQuitNotificationWineConfigDirKey = @"WineConfigDir";
+ static NSString* const WineExternalQuitNotificationWinePrefixKey = @"WinePrefix";
+@@ -1475,20 +1552,43 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+             CGPoint point = CGEventGetLocation([anEvent CGEvent]);
+             macdrv_event* event;
+             BOOL absolute;
++            double rawX = CGEventGetDoubleValueField([anEvent CGEvent], kCGEventUnacceleratedPointerMovementX);
++            double rawY = CGEventGetDoubleValueField([anEvent CGEvent], kCGEventUnacceleratedPointerMovementY);
++
++            mouse_stats_tick([anEvent timestamp]);
++            if (mouse_stats.f)
++            {
++                double acc = fabs([anEvent deltaX]) + fabs([anEvent deltaY]), raw = fabs(rawX) + fabs(rawY);
++                mouse_stats.events++;
++                if (raw > 0 && raw < 2.0) { mouse_stats.acc_slow += acc; mouse_stats.raw_slow += raw; mouse_stats.n_slow++; }
++                else if (raw >= 4.0) { mouse_stats.acc_fast += acc; mouse_stats.raw_fast += raw; mouse_stats.n_fast++; }
++            }
++
++            BOOL look = relative_look() && clientWantsCursorHidden && self.clippingCursor;
+ 
+             // If we recently warped the cursor (other than in our cursor-clipping
+             // event tap), discard mouse move events until we see an event which is
+             // later than that time.
+-            if (lastSetCursorPositionTime)
++            if (look)
++            {
++                lastSetCursorPositionTime = 0;
++                forceNextMouseMoveAbsolute = FALSE;
++            }
++            else if (lastSetCursorPositionTime)
+             {
+                 if ([anEvent timestamp] <= lastSetCursorPositionTime)
++                {
++                    if (mouse_stats.f) mouse_stats.warp_drops++;
+                     return;
++                }
+ 
+                 lastSetCursorPositionTime = 0;
+                 forceNextMouseMoveAbsolute = TRUE;
+             }
+ 
+-            if (forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow)
++            if (look)
++                absolute = FALSE;
++            else if (forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow)
+             {
+                 absolute = TRUE;
+                 forceNextMouseMoveAbsolute = FALSE;
+@@ -1556,11 +1656,21 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+             else
+             {
+                 double scale = retina_on ? 2 : 1;
++                CGFloat dx = [anEvent deltaX], dy = [anEvent deltaY];
++
++                if (raw_mouse_scale() > 0)
++                {
++                    /* device counts, sign learned from the accelerated delta (deltaY is flipped) */
++                    if (dx != 0 && rawX != 0) rawMouseSignX = (dx > 0) == (rawX > 0) ? 1 : -1;
++                    if (dy != 0 && rawY != 0) rawMouseSignY = (dy > 0) == (rawY > 0) ? 1 : -1;
++                    dx = rawX * (rawMouseSignX ? rawMouseSignX : 1) * raw_mouse_scale();
++                    dy = rawY * (rawMouseSignY ? rawMouseSignY : 1) * raw_mouse_scale();
++                }
+ 
+                 /* Add event delta to accumulated delta error */
+                 /* deltaY is already flipped */
+-                mouseMoveDeltaX += [anEvent deltaX];
+-                mouseMoveDeltaY += [anEvent deltaY];
++                mouseMoveDeltaX += dx;
++                mouseMoveDeltaY += dy;
+ 
+                 event = macdrv_create_event(MOUSE_MOVED_RELATIVE, targetWindow);
+                 event->mouse_moved.x = mouseMoveDeltaX * scale;
+@@ -1576,8 +1686,15 @@ - (void) handleMouseMove:(NSEvent*)anEvent
+                 event->mouse_moved.time_ms = [self ticksForEventTime:[anEvent timestamp]];
+                 event->mouse_moved.drag = drag;
+ 
++                if (mouse_stats.f)
++                {
++                    if (event->type == MOUSE_MOVED_ABSOLUTE) mouse_stats.abs_posted++;
++                    else mouse_stats.rel_posted++;
++                }
+                 [targetWindow.queue postEvent:event];
+             }
++            else if (mouse_stats.f)
++                mouse_stats.rel_zero++;
+ 
+             macdrv_release_event(event);
+ 
+@@ -2471,6 +2588,14 @@ static void DisplayReconfigCallback(CGDirectDisplayID display, CGDisplayChangeSu
+     - (void)applicationDidFinishLaunching:(NSNotification *)notification
+     {
+         CGDisplayRegisterReconfigurationCallback(DisplayReconfigCallback, NULL);
++        /* deadlock-gptk: WINE_MAC_NO_COALESCE=1 - AppKit merges mouse moves that arrive between two event-loop passes
++         * into one event with the summed delta (mouse coalescing, on by default). A 1000 Hz mouse then reaches the
++         * game as fewer, larger, unevenly sized steps; off = every device report is its own event. */
++        {
++            const char *s = getenv("WINE_MAC_NO_COALESCE");
++            if (s && *s == '1')
++                [NSEvent setMouseCoalescingEnabled:NO];
++        }
+     }
+ 
+     - (void)applicationDidBecomeActive:(NSNotification *)notification
+diff --git a/dlls/winemac.drv/event.c b/dlls/winemac.drv/event.c
+index 6dca848..9f6fad5 100644
+--- a/dlls/winemac.drv/event.c
++++ b/dlls/winemac.drv/event.c
+@@ -384,6 +384,10 @@ void macdrv_handle_event(const macdrv_event *event)
+     TRACE("%s for hwnd/window %p/%p\n", dbgstr_event(event->type), hwnd,
+           event->window);
+ 
++    /* deadlock-gptk: a throttled mouse move goes out before any other event (button after motion) */
++    if (event->type != MOUSE_MOVED_RELATIVE && event->type != MOUSE_MOVED_ABSOLUTE)
++        macdrv_flush_mouse_moved(TRUE);
++
+     prev = thread_data->current_event;
+     thread_data->current_event = event;
+ 
+@@ -531,6 +535,9 @@ BOOL macdrv_ProcessEvents(DWORD mask)
+         macdrv_handle_event(event);
+         macdrv_release_event(event);
+     }
++    /* deadlock-gptk: deliver a throttled mouse-move remainder once its interval has passed */
++    if (event_mask & event_mask_for_type(MOUSE_MOVED_RELATIVE))
++        macdrv_flush_mouse_moved(FALSE);
+ 
+     if (count) TRACE("processed %d events\n", count);
+     return mask == QS_ALLINPUT && !check_fd_events(macdrv_get_event_queue_fd(data->queue), POLLIN);
+diff --git a/dlls/winemac.drv/macdrv.h b/dlls/winemac.drv/macdrv.h
+index 2767256..177e079 100644
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -114,6 +114,11 @@ static inline RECT rect_from_cgrect(CGRect cgrect)
+     HKL                         active_keyboard_layout;
+     WORD                        keyc2vkey[128];
+     WORD                        keyc2scan[128];
++    /* deadlock-gptk: mouse moves held back by WINE_MOUSE_MOVE_HZ (accumulated, sent at most once per interval) */
++    BOOL                        mouse_move_pending;
++    HWND                        mouse_move_hwnd;
++    macdrv_event                mouse_move_event;
++    ULONG                       mouse_move_last_sent;
+ };
+ 
+ extern struct macdrv_thread_data *macdrv_init_thread_data(void);
+@@ -253,6 +258,7 @@ extern BOOL macdrv_SystemParametersInfo(UINT action, UINT int_param, void *ptr_p
+ 
+ extern void macdrv_mouse_button(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event);
++extern void macdrv_flush_mouse_moved(BOOL force);
+ extern void macdrv_mouse_scroll(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_release_capture(HWND hwnd, const macdrv_event *event);
+ 
+diff --git a/dlls/winemac.drv/mouse.c b/dlls/winemac.drv/mouse.c
+index 51ae29a..4c2cd68 100644
+--- a/dlls/winemac.drv/mouse.c
++++ b/dlls/winemac.drv/mouse.c
+@@ -874,6 +874,45 @@ void macdrv_mouse_button(HWND hwnd, const macdrv_event *event)
+ }
+ 
+ 
++/* deadlock-gptk: WINE_MOUSE_MOVE_HZ=N sends mouse moves to Windows at most N times a second per thread.
++ * Moves in between are added up (relative deltas summed, the latest absolute position kept), so no
++ * motion is lost; any remainder goes out with the next event or event pass after the interval. A
++ * 1000 Hz mouse otherwise keeps a game's message loop busy (every move is a hardware input + raw input
++ * message through the wineserver; under Rosetta the loop never empties and SDL spends ~10 ms a frame). */
++static UINT mouse_move_interval_ms(void)
++{
++    static int interval = -1;
++    if (interval < 0)
++    {
++        const char *s = getenv("WINE_MOUSE_MOVE_HZ");
++        int hz = s ? atoi(s) : 0;
++        interval = hz > 0 ? (1000 + hz - 1) / hz : 0;
++    }
++    return interval;
++}
++
++static void send_mouse_moved(HWND hwnd, const macdrv_event *event)
++{
++    UINT flags = MOUSEEVENTF_MOVE;
++
++    if (event->type == MOUSE_MOVED_ABSOLUTE)
++        flags |= MOUSEEVENTF_ABSOLUTE;
++
++    send_mouse_input(hwnd, event->window, flags, event->mouse_moved.x, event->mouse_moved.y,
++                     0, event->mouse_moved.drag, event->mouse_moved.time_ms);
++}
++
++void macdrv_flush_mouse_moved(BOOL force)
++{
++    struct macdrv_thread_data *data = macdrv_thread_data();
++
++    if (!data || !data->mouse_move_pending) return;
++    if (!force && NtGetTickCount() - data->mouse_move_last_sent < mouse_move_interval_ms()) return;
++    data->mouse_move_pending = FALSE;
++    data->mouse_move_last_sent = NtGetTickCount();
++    send_mouse_moved(data->mouse_move_hwnd, &data->mouse_move_event);
++}
++
+ /***********************************************************************
+  *              macdrv_mouse_moved
+  *
+@@ -882,12 +921,43 @@ void macdrv_mouse_button(HWND hwnd, const macdrv_event *event)
+ void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event)
+ {
+     UINT flags = MOUSEEVENTF_MOVE;
++    struct macdrv_thread_data *data;
+ 
+     TRACE("win %p/%p %s (%d,%d) drag %d time %lu (%lu ticks ago)\n", hwnd, event->window,
+           (event->type == MOUSE_MOVED_RELATIVE) ? "relative" : "absolute",
+           event->mouse_moved.x, event->mouse_moved.y, event->mouse_moved.drag,
+           event->mouse_moved.time_ms, (NtGetTickCount() - event->mouse_moved.time_ms));
+ 
++    if (mouse_move_interval_ms() && (data = macdrv_thread_data()))
++    {
++        macdrv_event *p = &data->mouse_move_event;
++
++        if (data->mouse_move_pending && (data->mouse_move_hwnd != hwnd || p->window != event->window ||
++                                         p->mouse_moved.drag != event->mouse_moved.drag))
++            macdrv_flush_mouse_moved(TRUE);
++        if (!data->mouse_move_pending)
++        {
++            *p = *event;
++            data->mouse_move_hwnd = hwnd;
++            data->mouse_move_pending = TRUE;
++        }
++        else if (event->type == MOUSE_MOVED_RELATIVE)
++        {
++            p->mouse_moved.x += event->mouse_moved.x;
++            p->mouse_moved.y += event->mouse_moved.y;
++            p->mouse_moved.time_ms = event->mouse_moved.time_ms;
++        }
++        else
++        {
++            p->type = MOUSE_MOVED_ABSOLUTE;
++            p->mouse_moved.x = event->mouse_moved.x;
++            p->mouse_moved.y = event->mouse_moved.y;
++            p->mouse_moved.time_ms = event->mouse_moved.time_ms;
++        }
++        macdrv_flush_mouse_moved(FALSE);
++        return;
++    }
++
+     if (event->type == MOUSE_MOVED_ABSOLUTE)
+         flags |= MOUSEEVENTF_ABSOLUTE;
+ 

@@ -1,0 +1,135 @@
+server/thread.c thread QoS options in one patch (regenerated 2026-10-24 from the live tree on top of 0011): WINE_MAINTHRD_QOS,
+WINE_JOBTHRD_QOS and the e-core thread legacy-policy skip. Replaces the old 0015 (corrupt), 0017 and 0019 (no longer applied
+in sequence); originals in superseded/. 0016 (alert fast path) is deliberately not in the tree: superseded/ too.
+
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -241,9 +241,83 @@
+     if (boost < 0)
+     {
+         const char *env = getenv( "WINE_QOS_BOOST" );
++        boost = env && env[0] == '1';
++    }
++    return boost;
++}
++
++/* deadlock-gptk: WINE_MAINTHRD_QOS=1 maps the Windows thread named MainThrd to the top
++ * non-realtime Mach QoS tier (USER_INTERACTIVE). Opt-in; for sustained FPS under thermal fair. */
++static int mainthrd_qos(void)
++{
++    static int boost = -1;
++    if (boost < 0)
++    {
++        const char *env = getenv( "WINE_MAINTHRD_QOS" );
+         boost = env && env[0] == '1';
+     }
+     return boost;
++}
++
++static int thread_desc_is_mainthrd( const struct thread *thread )
++{
++    static const WCHAR name[] = {'M','a','i','n','T','h','r','d'};
++    return thread->desc && thread->desc_len == sizeof(name)
++           && !memcmp( thread->desc, name, sizeof(name) );
++}
++
++/* deadlock-gptk: WINE_JOBTHRD_QOS=1 puts the game's performance-core job workers (GlobPool/P*),
++ * which MainThrd waits on every frame, above the DXMT encode/audio/render threads and just below
++ * MainThrd; the game creates them below normal, so busy P-cores kept preempting them. */
++static int jobthrd_qos(void)
++{
++    static int boost = -1;
++    if (boost < 0)
++    {
++        const char *env = getenv( "WINE_JOBTHRD_QOS" );
++        boost = env && env[0] == '1';
++    }
++    return boost;
++}
++
++static int thread_desc_is_pjob( const struct thread *thread )
++{
++    static const WCHAR prefix[] = {'G','l','o','b','P','o','o','l','/','P'};
++    return thread->desc && thread->desc_len >= sizeof(prefix)
++           && !memcmp( thread->desc, prefix, sizeof(prefix) );
++}
++
++/* deadlock-gptk: with WINE_ECORE_THREADS set (see ntdll patch 0018), threads on that list must
++ * never get the legacy Mach policies below: once a thread has them, macOS refuses the QoS class
++ * the thread later sets on itself (EPERM). The game lowers its job workers' priority before it
++ * names them, so unnamed below-normal threads are left alone too. */
++static int ecore_skip_policies( const struct thread *thread )
++{
++    static char list[512];
++    static int init;
++    const char *p;
++
++    if (!init)
++    {
++        const char *env = getenv( "WINE_ECORE_THREADS" );
++        if (env) snprintf( list, sizeof(list), "%s", env );
++        init = 1;
++    }
++    if (!list[0]) return 0;
++    if (!thread->desc) return thread->base_priority < THREAD_PRIORITY_NORMAL;
++    for (p = list; *p; )
++    {
++        const char *end = strchr( p, ',' );
++        size_t i, len = end ? (size_t)(end - p) : strlen( p );
++        if (len && len <= thread->desc_len / sizeof(WCHAR))
++        {
++            for (i = 0; i < len; i++) if (thread->desc[i] != (unsigned char)p[i]) break;
++            if (i == len) return 1;
++        }
++        if (!end) break;
++        p = end + 1;
++    }
++    return 0;
+ }
+ 
+ static int get_mach_importance( int effective_priority )
+@@ -263,6 +337,7 @@
+     int effective_priority = get_effective_thread_priority( thread );
+ 
+     if (!process_port) return;
++    if (ecore_skip_policies( thread )) return;
+     kr = mach_port_extract_right( process_port, thread->unix_tid,
+                                   MACH_MSG_TYPE_COPY_SEND, &thread_port, &type );
+     if (kr != KERN_SUCCESS) return;
+@@ -305,6 +380,24 @@
+         latency_qos = LATENCY_QOS_TIER_1;
+         thread_precedence_policy.importance = max( thread_precedence_policy.importance,
+                                                    get_mach_importance( effective_priority - thread->base_priority ));
++    }
++    if (mainthrd_qos() && thread_desc_is_mainthrd( thread )
++        && effective_priority < LOW_REALTIME_PRIORITY)
++    {
++        throughput_qos = THROUGHPUT_QOS_TIER_0;
++        latency_qos = LATENCY_QOS_TIER_0;
++        thread_extended_policy.timeshare = 1;
++        thread_precedence_policy.importance = max( thread_precedence_policy.importance,
++                                                   get_mach_importance( 14 ));
++    }
++    if (jobthrd_qos() && thread_desc_is_pjob( thread )
++        && effective_priority < LOW_REALTIME_PRIORITY)
++    {
++        throughput_qos = THROUGHPUT_QOS_TIER_0;
++        latency_qos = LATENCY_QOS_TIER_0;
++        thread_extended_policy.timeshare = 1;
++        thread_precedence_policy.importance = max( thread_precedence_policy.importance,
++                                                   get_mach_importance( 12 ));
+     }
+     /* QOS_UNSPECIFIED is assigned the highest tier available, so it does not provide a limit */
+     if (effective_priority >= LOW_REALTIME_PRIORITY || effective_priority > thread->priority)
+@@ -912,6 +1005,11 @@
+                 free( thread->desc );
+                 thread->desc = desc;
+                 thread->desc_len = desc_len;
++#ifdef __APPLE__
++                /* MainThrd QoS depends on the description; re-apply after rename. */
++                if (thread->state == RUNNING && thread->unix_tid != -1)
++                    apply_thread_priority( thread );
++#endif
+             }
+         }
+         else

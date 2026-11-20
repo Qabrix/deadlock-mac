@@ -1,0 +1,12 @@
+--- a/neutron
++++ b/neutron
+@@ -476,7 +476,8 @@
+     plutil -replace CFBundleIdentifier -string "net.lixsl.neutron.app$APP_ID" "$app/Contents/Info.plist"
+     [ -n "${NEUTRON_APP_NAME:-}" ] && plutil -replace CFBundleName -string "$NEUTRON_APP_NAME" "$app/Contents/Info.plist"
+     tmp="$(mktemp -d)"
+-    if command -v python3 >/dev/null && [ -f "$exe" ] \
++    # deadlock-mac: /usr/bin/python3 is only a stub that asks to install the developer tools when they are missing
++    if xcode-select -p >/dev/null 2>&1 && command -v python3 >/dev/null && [ -f "$exe" ] \
+        && python3 -I "$script_dir/peicon.py" "$exe" "$tmp/icon.ico" \
+        && sips -s format png "$tmp/icon.ico" --out "$tmp/icon.png" >/dev/null 2>&1 \
+        && sips -z 256 256 "$tmp/icon.png" --out "$tmp/icon.png" >/dev/null 2>&1 \

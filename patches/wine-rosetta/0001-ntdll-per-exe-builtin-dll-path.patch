@@ -1,0 +1,70 @@
+--- a/dlls/ntdll/unix/loader.c	2026-10-13 01:09:05
++++ b/dlls/ntdll/unix/loader.c	2026-10-13 01:09:05
+@@ -1769,6 +1769,59 @@
+     free( unix_name );
+     free( true_nt_name.Buffer );
+     return status;
++}
++
++
++/***********************************************************************
++ *           apply_exe_dll_path
++ *
++ * deadlock-gptk: per-executable builtin DLL directories.
++ * WINE_EXE_DLLPATH="deadlock.exe=/dir/a:/dir/b;other.exe=/dir/c" puts /dir/a and /dir/b in
++ * front of the builtin search path when the main executable is deadlock.exe. That gives one
++ * program a D3D backend (D3DMetal, DXMT) while the rest of the prefix -- Steam's web UI in
++ * particular, which crashes as soon as it can see D3DMetal's nvapi64 -- keeps Wine's own.
++ * Names are matched case-insensitively on the basename; the variable is inherited, so it
++ * also covers programs started by Steam.
++ */
++static void apply_exe_dll_path( const UNICODE_STRING *nt_name )
++{
++    const char *env = getenv( "WINE_EXE_DLLPATH" );
++    const WCHAR *name, *end, *p;
++    char exe[256], *spec, *entry, *save_entry, *eq, *dir, *save_dir;
++    const char *dirs[32];
++    unsigned int i, len, ndirs;
++
++    if (!env || !*env || !nt_name || !nt_name->Buffer) return;
++    end = nt_name->Buffer + nt_name->Length / sizeof(WCHAR);
++    for (name = p = nt_name->Buffer; p < end; p++) if (*p == '\\' || *p == '/') name = p + 1;
++    len = end - name;
++    if (!len || len >= sizeof(exe)) return;
++    for (i = 0; i < len; i++)
++    {
++        if (name[i] > 0x7f) return;
++        exe[i] = (name[i] >= 'A' && name[i] <= 'Z') ? name[i] + 32 : name[i];
++    }
++    exe[len] = 0;
++
++    if (!(spec = strdup( env ))) return;
++    for (entry = strtok_r( spec, ";", &save_entry ); entry; entry = strtok_r( NULL, ";", &save_entry ))
++    {
++        if (!(eq = strchr( entry, '=' ))) continue;
++        *eq = 0;
++        if (strcasecmp( entry, exe )) continue;
++        ndirs = 0;
++        for (dir = strtok_r( eq + 1, ":", &save_dir ); dir && ndirs < ARRAY_SIZE(dirs); dir = strtok_r( NULL, ":", &save_dir ))
++            dirs[ndirs++] = dir;
++        /* prepend in reverse so the first listed directory is searched first */
++        while (ndirs--)
++        {
++            char *copy = strdup( dirs[ndirs] );
++            if (!copy) continue;
++            prepend_dll_path( copy );
++            TRACE( "%s: builtin dll path %s\n", exe, copy );
++        }
++    }
++    free( spec );
+ }
+ 
+ 
+@@ -1783,6 +1836,7 @@
+     BOOL is_system_dir = is_system_dir_path( nt_name, &search_machine );
+     enum loadorder loadorder = get_load_order( nt_name, is_system_dir, NULL );
+ 
++    apply_exe_dll_path( nt_name );
+     status = open_main_image( nt_name, module, &main_image_info, loadorder, load_machine );
+ 
+     switch (status)

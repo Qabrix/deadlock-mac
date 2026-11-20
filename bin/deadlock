@@ -1,0 +1,175 @@
+#!/bin/zsh
+# deadlock-mac: Deadlock on Apple-silicon Macs through our own Wine and DXMT builds.
+#
+#   deadlock [play] [options] [-- game args]   start the game
+#     --rosetta | --arm64     which path (default: the last one used, else rosetta; DL_PATH)
+#     --map NAME              start straight into a custom map (deadlock mods maps); --no-cheats: without sv_cheats 1
+#     --parkour               practice keys on sv_cheats maps: Q checkpoint, E teleport, T stopwatch, H clear
+#     --wheel                 scroll-wheel jump helpers (Jump bound to Space and the wheel)
+#     --no-dlss               don't offer DLSS (default: on once Apple's nvngx.dll is imported, deadlock gptk)
+#     --vsync                 present in step with the display (default: lowest latency)
+#     --framegen auto|1       MetalFX frame generation (macOS 26+, needs DLSS selected in game)
+#     --hud                   Metal performance HUD
+#     --steam-window          Rosetta: Steam's window visible (needed to answer its dialogs)
+#     --overlay               Rosetta: Steam overlay (Shift+Tab) on (costs CPU)
+#   deadlock setup            create the Wine prefix and install Windows Steam into it
+#   deadlock install          open Steam to log in; queues the Deadlock download (~40 GB)
+#   deadlock steam            open Windows Steam's window
+#   deadlock update [--force] bring the game files up to date (the ARM64 path does this itself)
+#   deadlock kill             stop the game and Steam of both paths
+#   deadlock gptk <dmg>       import Apple's signed nvngx.dll from the Game Porting Toolkit download (enables DLSS)
+#   deadlock mods install <file.vpk> [name] | list | maps
+#   deadlock doctor           hardware, chosen settings, what is installed
+#   deadlock status           the same as key=value lines (the launcher reads them)
+set -euo pipefail
+setopt NO_BG_NICE   # zsh would renice background jobs: Steam and the game below every normal app
+source "${0:A:h:h}/lib/common.sh"
+source "$DL_APP/lib/hw.sh"
+source "$DL_APP/lib/game.sh"
+source "$DL_APP/lib/rosetta.sh"
+source "$DL_APP/lib/arm64.sh"
+
+PATH_FILE=$DL_ROOT/.path
+if [[ ${1:-} == (-h|--help|help) ]]; then sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p;}' "$0"; exit 0; fi
+cmd=play
+[[ ${1:-} == (play|setup|install|steam|update|kill|gptk|mods|doctor|status) ]] && { cmd=$1; shift; }
+
+if [[ $cmd == play ]]; then
+  GAME_PATH=${DL_PATH:-$(cat "$PATH_FILE" 2>/dev/null || print rosetta)}
+  MAP= MODS=${DL_MODS:-0} PARKOUR=0 WHEEL=${DL_WHEEL:-0} DLSS=${DL_DLSS:-1} VSYNC=${DL_VSYNC:-0} FRAMEGEN= HUD=0
+  STEAMGPU=0 OVERLAY=0 EXTRA_ARGS=()
+  while (( $# )); do
+    case $1 in
+      --rosetta) GAME_PATH=rosetta ;;
+      --arm64) GAME_PATH=arm64 ;;
+      --map) MAP=$2; shift ;;
+      --no-cheats) DL_MAP_CHEATS=0 ;;
+      --mods) MODS=1 ;;
+      --mods=*) MODS=${1#*=} ;;
+      --parkour) PARKOUR=1 ;;
+      --wheel) WHEEL=1 ;;
+      --dlss) DLSS=1; DLSS_ASKED=1 ;;
+      --no-dlss) DLSS=0 ;;
+      --vsync) VSYNC=1 ;;
+      --framegen) FRAMEGEN=$2; shift ;;
+      --hud) HUD=1 ;;
+      --steam-window) STEAMGPU=1 ;;
+      --overlay) OVERLAY=1 ;;
+      --) shift; EXTRA_ARGS=("$@"); break ;;
+      *) die "unknown option: $1 (deadlock --help)" ;;
+    esac
+    shift
+  done
+  if [[ -n $FRAMEGEN ]]; then
+    hw_detect
+    (( HW_FRAMEGEN )) || die "frame generation needs macOS 26 or newer (this Mac: $HW_MACOS)"
+  fi
+  mkdir -p "$DL_ROOT"; print -r -- $GAME_PATH > "$PATH_FILE"
+  case $GAME_PATH in
+    rosetta) rosetta_play ;;
+    arm64) arm64_play ;;
+    *) die "unknown path: $GAME_PATH (rosetta|arm64)" ;;
+  esac
+  exit
+fi
+
+case $cmd in
+  setup)
+    [[ $(uname -m) == arm64 ]] || die "Apple silicon only"
+    hw_detect
+    (( HW_MACOS_MAJOR >= 15 )) || die "macOS 15 or newer needed (this Mac: $HW_MACOS)"
+    wine_env
+    mkdir -p "$DL_ROOT" "$DL_CACHE" "$DL_LOGS"
+    free_gb=$(( $(df -k "$DL_ROOT" | awk 'NR==2{print $4}') / 1024 / 1024 ))
+    (( free_gb >= 50 )) || warn "only $free_gb GB free; Deadlock and its shader caches want ~50 GB"
+    if [[ ! -f $DL_PREFIX/system.reg ]]; then
+      step "Creating the Wine prefix"
+      "$WINE" wineboot --init > "$DL_LOGS/wineboot.log" 2>&1
+      "$WINESERVER" -w
+      ok "prefix created"
+    fi
+    reg() { "$WINE" reg add "$@" /f >/dev/null 2>&1; }
+    # the game renders at the display's "looks like" size and macOS scales it (native Retina is ~4x the pixels)
+    reg 'HKCU\Software\Wine\Mac Driver' /v RetinaMode /t REG_SZ /d n
+    reg 'HKCU\Software\Wine' /v Version /t REG_SZ /d win10
+    for d in d3d11 d3d10core; do
+      reg 'HKCU\Software\Wine\AppDefaults\steamwebhelper.exe\DllOverrides' /v $d /t REG_SZ /d native,builtin
+    done
+    # crash dialogs would freeze a crashed process behind a hidden window
+    reg 'HKCU\Software\Wine\WineDbg' /v ShowCrashDialog /t REG_DWORD /d 0
+    gptk_ok && cp -f "$GPTK_DIR/nvngx.dll" "$DL_PREFIX/drive_c/windows/system32/nvngx.dll"
+    ok "prefix settings applied"
+    if [[ ! -f $STEAM_EXE ]]; then
+      setup_exe=$DL_CACHE/SteamSetup.exe
+      [[ -f $setup_exe ]] || { step "Downloading SteamSetup.exe"; curl -fL --progress-bar -o "$setup_exe" "$STEAM_SETUP_URL"; }
+      step "Installing Windows Steam into the prefix"
+      "$WINE" "$setup_exe" /S > "$DL_LOGS/steam-install.log" 2>&1
+      "$WINESERVER" -w
+      [[ -f $STEAM_EXE ]] || die "Steam install failed, see $DL_LOGS/steam-install.log"
+      ok "Steam installed"
+    else
+      ok "Steam present"
+    fi
+    ok "setup done; next: deadlock install (log in to Steam, the download starts)"
+    ;;
+  install)
+    rosetta_steam "steam://install/$APPID"
+    ok "Steam starting: log in and confirm the Deadlock install dialog"
+    ;;
+  steam)
+    rosetta_steam
+    ok "Steam starting"
+    ;;
+  update)
+    rosetta_update "$@"
+    ;;
+  kill)
+    arm64_kill
+    rosetta_kill
+    restore_desktop_mode
+    ;;
+  gptk)
+    dmg=${1:-}
+    [[ -f $dmg ]] || die "usage: deadlock gptk <Game_Porting_Toolkit_*.dmg> (developer.apple.com/games, free Apple account)"
+    mnt=$(mktemp -d "${TMPDIR:-/tmp}/dl-gptk.XXXX")
+    cleanup() { hdiutil detach -quiet "$mnt/eval" 2>/dev/null || true; hdiutil detach -quiet "$mnt/outer" 2>/dev/null || true; rm -rf "$mnt"; }
+    trap cleanup EXIT
+    mkdir -p "$mnt/outer" "$mnt/eval"
+    hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mnt/outer" "$dmg" || die "could not open ${dmg:t}"
+    inner=("$mnt/outer"/Evaluation\ environment*.dmg(N))
+    (( ${#inner} == 1 )) || die "no 'Evaluation environment' image inside ${dmg:t}"
+    hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mnt/eval" "$inner[1]" || die "could not open ${inner[1]:t}"
+    src="$mnt/eval/redist/lib/wine/x86_64-windows/nvngx-on-metalfx.dll"
+    [[ -f $src ]] || die "no nvngx-on-metalfx.dll in this toolkit version"
+    mkdir -p "$GPTK_DIR"; cp -f "$src" "$GPTK_DIR/nvngx.dll"
+    [[ -d $DL_PREFIX/drive_c/windows/system32 ]] && cp -f "$GPTK_DIR/nvngx.dll" "$DL_PREFIX/drive_c/windows/system32/nvngx.dll"
+    ok "DLSS enabled: Apple's nvngx.dll imported (select DLSS in the game's video settings)"
+    ;;
+  mods)
+    exec "$DL_APP/tools/mods.sh" "$@"
+    ;;
+  doctor|status)
+    if [[ $cmd == doctor ]]; then
+      print "Hardware and settings:"; hw_print | sed 's/^/  /; s/=/: /'
+      print "Installed:"
+    else
+      hw_print
+    fi
+    st() { if [[ $cmd == doctor ]]; then print "  $1: $([[ $2 == 1 ]] && print yes || print no)"; else print "$1=$2"; fi; }
+    st runtime_rosetta $([[ -x $ROSETTA_HOME/bin/wine ]] && print 1 || print 0)
+    st runtime_arm64 $([[ -x $ARM64_HOME/neutron ]] && print 1 || print 0)
+    st rosetta2 $(rosetta_ok && print 1 || print 0)
+    st prefix $([[ -f $DL_PREFIX/system.reg ]] && print 1 || print 0)
+    st windows_steam $([[ -f $STEAM_EXE ]] && print 1 || print 0)
+    st game $([[ -f $GAME_DIR/game/bin/win64/deadlock.exe ]] && print 1 || print 0)
+    st dlss $(gptk_ok && print 1 || print 0)
+    st mac_steam $([[ -d /Applications/Steam.app ]] && print 1 || print 0)
+    st running $(game_running && print 1 || print 0)
+    if [[ $cmd == status ]]; then
+      print "path=$(cat "$PATH_FILE" 2>/dev/null || print rosetta)"
+      print "root=$DL_ROOT"
+    else
+      print "Data: $DL_ROOT  Logs: $DL_LOGS"
+    fi
+    ;;
+esac

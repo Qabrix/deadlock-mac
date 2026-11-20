@@ -1,0 +1,28 @@
+--- a/dlls/wined3d/directx.c	2026-10-13 09:58:37
++++ b/dlls/wined3d/directx.c	2026-10-13 09:58:37
+@@ -921,9 +921,25 @@
+     if ((version_info = get_driver_version_info(driver, driver_model))
+             || (version_info = get_driver_version_info(driver, DRIVER_MODEL_GENERIC)))
+     {
++        char env[64];
++        unsigned int a, b, c, d;
++
+         driver_info->name = version_info->driver_name;
+         driver_info->version_high = MAKEDWORD_VERSION(driver_os_version, driver_feature_level);
+         driver_info->version_low = MAKEDWORD_VERSION(version_info->subversion, version_info->build);
++
++        /* deadlock-gptk: WINE_DRIVER_VERSION=a.b.c.d overrides the reported driver version.
++         * D3DMetal forwards adapter queries to this dxgi/wined3d, which describes the real
++         * (Apple) GPU with a fallback GeForce 8 profile (31.0.13.4052). Games that see an
++         * NVIDIA vendor then reject the "old driver" (Deadlock: < 32.0.15.8108 disables async
++         * shader creation and DLSS). */
++        if (GetEnvironmentVariableA("WINE_DRIVER_VERSION", env, sizeof(env))
++                && sscanf(env, "%u.%u.%u.%u", &a, &b, &c, &d) == 4)
++        {
++            driver_info->version_high = MAKEDWORD_VERSION(a, b);
++            driver_info->version_low = MAKEDWORD_VERSION(c, d);
++            TRACE("Driver version overridden to %s.\n", debugstr_a(env));
++        }
+ 
+         return true;
+     }

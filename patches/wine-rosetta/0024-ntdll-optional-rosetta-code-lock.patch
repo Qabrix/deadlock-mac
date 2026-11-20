@@ -1,0 +1,103 @@
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -2104,6 +2104,92 @@
+  * themselves so onto the efficiency cores: darwin background (default, strictly E-cores) or
+  * WINE_ECORE_MODE=utility (QoS utility, E-preferred). With fewer busy performance cores the P-cluster
+  * keeps a higher clock for the threads left there (MainThrd). */
++#include <mach/mach_vm.h>
++#include <sys/mman.h>
++/* deadlock-gptk: WINE_LOCK_ROSETTA=1 keeps Rosetta's translated code of this process in RAM. A helper thread
++ * (started when the game names its MainThrd) wires every used page of Rosetta's executable heap, indirect-branch
++ * map and generic metadata every 15 s, so translations that macOS would compress under memory pressure never
++ * stall the game thread that runs them. Unused pages are left alone (page dispositions). */
++static unsigned long rosetta_lock_range( mach_vm_address_t addr, mach_vm_size_t size )
++{
++    static int disp[4096];
++    unsigned long locked = 0;
++    mach_vm_address_t a = addr, end = addr + size, run = 0;
++    const mach_vm_size_t pg = vm_page_size;
++
++    while (a < end)
++    {
++        mach_vm_size_t chunk = end - a, count;
++        unsigned int i;
++        if (chunk > 4096 * pg) chunk = 4096 * pg;
++        count = chunk / pg;
++        if (mach_vm_page_range_query( mach_task_self(), a, chunk, (mach_vm_address_t)disp, &count ) != KERN_SUCCESS)
++            break;
++        for (i = 0; i < count; i++)
++        {
++            int used = disp[i] & (VM_PAGE_QUERY_PAGE_PRESENT | VM_PAGE_QUERY_PAGE_PAGED_OUT);
++            mach_vm_address_t pa = a + i * pg;
++            if (used && !run) run = pa;
++            if (!used && run)
++            {
++                if (!mlock( (void *)run, pa - run )) locked += pa - run;
++                run = 0;
++            }
++        }
++        a += count * pg;
++        if (!count) break;
++    }
++    if (run && !mlock( (void *)run, a - run )) locked += a - run;
++    return locked;
++}
++
++static void *rosetta_lock_thread( void *arg )
++{
++    unsigned int round = 0;
++    pthread_setname_np( "wine-rosetta-lock" );
++    for (;;)
++    {
++        mach_vm_address_t addr = 0;
++        unsigned long locked = 0, regions = 0;
++        for (;;)
++        {
++            mach_vm_size_t size = 0;
++            natural_t depth = 0;
++            vm_region_submap_info_data_64_t info;
++            mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
++            if (mach_vm_region_recurse( mach_task_self(), &addr, &size, &depth, (vm_region_recurse_info_t)&info,
++                                        &count ) != KERN_SUCCESS) break;
++            if (!info.is_submap && (info.user_tag == VM_MEMORY_ROSETTA_EXECUTABLE_HEAP ||
++                                    info.user_tag == VM_MEMORY_ROSETTA_INDIRECT_BRANCH_MAP ||
++                                    info.user_tag == VM_MEMORY_ROSETTA))
++            {
++                locked += rosetta_lock_range( addr, size );
++                regions++;
++            }
++            addr += size;
++        }
++        if (round++ % 20 == 0)
++            fprintf( stderr, "deadlock-gptk: rosetta-lock: %lu MB wired in %lu regions\n", locked >> 20, regions );
++        sleep( 15 );
++    }
++    return NULL;
++}
++
++static void rosetta_lock_start(void)
++{
++    static int started;
++    pthread_attr_t attr;
++    pthread_t thread;
++    const char *e = getenv( "WINE_LOCK_ROSETTA" );
++
++    if (started++ || !e || strcmp( e, "1" )) return;
++    pthread_attr_init( &attr );
++    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
++    pthread_attr_set_qos_class_np( &attr, QOS_CLASS_UTILITY, 0 );
++    pthread_create( &thread, &attr, rosetta_lock_thread, NULL );
++    pthread_attr_destroy( &attr );
++}
++
+ static void ecore_for_thread_name( const char *name )
+ {
+     static char list[512];
+@@ -2194,6 +2280,7 @@
+     nameA[len] = '\0';
+     pthread_setname_np( nameA );
+     ecore_for_thread_name( nameA );
++    if (!strcmp( nameA, "MainThrd" )) rosetta_lock_start();
+ #elif defined(__FreeBSD__)
+     unsigned int status;
+     char nameA[64];

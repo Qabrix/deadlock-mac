@@ -1,0 +1,115 @@
+Subject: ntdll, server: msync objects and futex queues one per 128-byte cache line
+
+msync shm slots were 16 bytes, allocated one after another: eight unrelated events/semaphores/mutexes per
+Apple silicon cache line, every set/reset/wait bounced it between cores. The server now uses 128-byte slots
+(WINE_MSYNC_SHM_SHIFT=4 restores 16) and publishes the size in the never-allocated slot 0 for the clients.
+ntdll futex queues (WaitOnAddress, SRW locks, condition variables) were 24 bytes with neighbouring objects
+hashed to neighbouring queues; now one queue per line.
+
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -829,7 +829,10 @@
+     DWORD tid;
+ };
+ 
+-struct futex_queue
++/* deadlock-gptk: one queue per 128-byte cache line (Apple silicon line size). The hash puts objects 16 bytes
++ * apart into neighbouring queues, so with 24-byte queues the spinlocks of unrelated SRW locks, condition variables
++ * and WaitOnAddress words shared lines and every lock/unlock bounced them between cores. */
++struct DECLSPEC_ALIGN(128) futex_queue
+ {
+     struct list queue;
+     LONG lock;
+--- a/dlls/ntdll/unix/msync.c
++++ b/dlls/ntdll/unix/msync.c
+@@ -558,11 +558,15 @@
+ }
+ 
+ static os_unfair_lock shm_addrs_lock = OS_UNFAIR_LOCK_INIT;
++
++/* deadlock-gptk: log2 of the bytes per shm slot, chosen by the server (WINE_MSYNC_SHM_SHIFT, default 7 = one object
++ * per 128-byte cache line) and read from slot 0 in msync_init */
++static int shm_shift = 4;
+ 
+ static void *get_shm_slow( unsigned int idx )
+ {
+-    int entry  = (idx * 16) / pagesize;
+-    int offset = (idx * 16) % pagesize;
++    int entry  = ((unsigned long)idx << shm_shift) / pagesize;
++    int offset = ((unsigned long)idx << shm_shift) % pagesize;
+     void *ret;
+ 
+     os_unfair_lock_lock( &shm_addrs_lock );
+@@ -598,8 +602,8 @@
+ 
+ static inline void *get_shm( const unsigned int idx )
+ {
+-    int entry = idx >> (vm_kernel_page_shift - 4);
+-    int offset = (idx << 4) & vm_kernel_page_mask;
++    int entry = idx >> (vm_kernel_page_shift - shm_shift);
++    int offset = (idx << shm_shift) & vm_kernel_page_mask;
+ 
+     if (entry >= shm_addrs_size || !shm_addrs[entry])
+         return get_shm_slow( idx );
+@@ -700,6 +704,13 @@
+         ERR("Failed to map tid shared memory");
+         exit(1);
+     }
++
++    /* slot 0 is never an object: the server keeps its slot size there (an older server leaves it 0) */
++    {
++        int shift = *(volatile int *)get_shm_slow( 0 );
++        if (shift >= 4 && shift <= 7) shm_shift = shift;
++        TRACE( "shm slot size %u bytes\n", 1u << shm_shift );
++    }
+ }
+ 
+ 
+--- a/server/msync.c
++++ b/server/msync.c
+@@ -375,6 +375,12 @@
+     short single_waiters;     /* threads parked on this object's own word */
+ };
+ 
++/* deadlock-gptk: log2 of the bytes per shm slot. Objects are allocated one after another, so with 16-byte slots
++ * eight unrelated events/semaphores/mutexes shared a 128-byte cache line and every set/reset/wait bounced it between
++ * cores. Default 7 = one object per line; WINE_MSYNC_SHM_SHIFT=4 restores the packed layout. Published in slot 0
++ * (never allocated: shm_idx 0 means "no shm") for the clients. */
++static int shm_shift = 7;
++
+ static unsigned int last_allocated_idx = 1;
+ static unsigned int last_destroyed_idx = UINT32_MAX;
+ 
+@@ -601,6 +607,12 @@
+     if (!do_msync()) return;
+ 
+     pagesize = (long)vm_kernel_page_size;
++
++    if (getenv( "WINE_MSYNC_SHM_SHIFT" ))
++    {
++        int shift = atoi( getenv( "WINE_MSYNC_SHM_SHIFT" ) );
++        if (shift >= 4 && shift <= 7) shm_shift = shift;
++    }
+ 
+     shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
+     shm_addrs_size = 128;
+@@ -613,6 +625,8 @@
+         fprintf( stderr, "msync: error: mach_vm_map failed with %d: %s\n", kr, mach_error_string( kr ) );
+         fatal_error( "could not map tid shared memory\n" );
+     }
++
++    *(int *)get_shm( 0 ) = shm_shift;
+ }
+ 
+ void msync_init(void)
+@@ -698,8 +712,8 @@
+ 
+ static void *get_shm( unsigned int idx )
+ {
+-    int entry  = (idx * 16) / pagesize;
+-    int offset = (idx * 16) % pagesize;
++    int entry  = ((unsigned long)idx << shm_shift) / pagesize;
++    int offset = ((unsigned long)idx << shm_shift) % pagesize;
+ 
+     if (entry >= shm_addrs_size)
+     {

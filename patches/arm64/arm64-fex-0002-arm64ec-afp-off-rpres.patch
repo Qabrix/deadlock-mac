@@ -1,0 +1,58 @@
+diff --git a/Source/Common/HostFeatures.cpp b/Source/Common/HostFeatures.cpp
+index 858d76d71..79c56f3dc 100644
+--- a/Source/Common/HostFeatures.cpp
++++ b/Source/Common/HostFeatures.cpp
+@@ -597,6 +597,12 @@ void FetchHostFeatures(FEX::CPUFeatures& Features, FEXCore::HostFeatures& HostFe
+ 
+   HandleErrata(&HostFeatures, MIDR);
+   OverrideFeatures(&HostFeatures, ForceSVEWidth());
++
++  // (athei cc23d2cae79) RPRES only increases the precision of FRECPE and FRSQRTE when FPCR.AH is set, which FEX only
++  // does with AFP.
++  if (!HostFeatures.SupportsAFP) {
++    HostFeatures.SupportsRPRES = false;
++  }
+ }
+ 
+ FEXCore::HostFeatures FetchHostFeatures() {
+diff --git a/Source/Windows/ARM64EC/Module.S b/Source/Windows/ARM64EC/Module.S
+index d036cd228..eed0ad4d0 100644
+--- a/Source/Windows/ARM64EC/Module.S
++++ b/Source/Windows/ARM64EC/Module.S
+@@ -73,10 +73,16 @@ BeginSimulation:
+   // Expects the target code address in x9
+ .global ExitFunctionEC
+ ExitFunctionEC:
+-  // Clear any the AFP NEP and AH bits in FPCR as native code won't expect their behaviour.
++  // Clear the AFP NEP and AH bits in FPCR as native code won't expect their behaviour. Skip the write when they are
++  // already clear, which is always the case unless AFP is in use, as FPCR writes are slow on some hardware. NZCV still
++  // holds the guest flags here, so test the bits without touching it. (athei cc23d2cae79, adapted to LOAD_TEB)
+   mrs x17, fpcr
++  tbnz x17, #1, 1f // AH
++  tbz x17, #2, 2f // NEP
++1:
+   and x17, x17, #~6 // NEP + AH
+   msr fpcr, x17
++2:
+   LOAD_TEB x17, x16
+   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+diff --git a/Source/Windows/Common/CPUFeatures.cpp b/Source/Windows/Common/CPUFeatures.cpp
+index c033db8af..38deec19d 100644
+--- a/Source/Windows/Common/CPUFeatures.cpp
++++ b/Source/Windows/Common/CPUFeatures.cpp
+@@ -64,6 +64,14 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
+ 
+   CPUFeaturesFromRegistry Features(Key);
+ 
++  if (HostType == FEXCore::HostFeatures::HostTypeEnum::Arm64ec) {
++    // (athei cc23d2cae79) Native ARM64EC code requires FPCR.AH and FPCR.NEP to be clear, so with AFP every transition
++    // between the JIT and native code writes FPCR twice (~9 ns each on Apple M-series). ARM64EC processes make these
++    // transitions far more often than the AFP code sequences save, so don't use AFP by default.
++    // HostFeatures=enableafp still turns it back on.
++    Features.RemoveFeature(FEX::CPUFeatures::Feature::AFP);
++  }
++
+   uint64_t CTR = ReadRegU64(Key, "CP 5801");
+   uint64_t MIDR = ReadRegU64(Key, "CP 4000");
+ 

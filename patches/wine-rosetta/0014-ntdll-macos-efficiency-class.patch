@@ -1,0 +1,84 @@
+From: deadlock-gptk
+Subject: [PATCH] ntdll: report M4 performance cores on macOS
+
+Wine's macOS topology path leaves every Windows EfficiencyClass at zero.
+On the validated 10-core Mac16,13, expose logical CPUs 6-9 as the four
+performance cores.  Windows defines a larger EfficiencyClass as faster and
+less energy efficient.
+
+Apple's public perf-level sysctls expose the class counts but do not promise
+CPU-number ordering on future machines, so fail closed unless every observed
+model, class name, and count matches this machine.  WINENCPU also keeps the
+old homogeneous topology because it can truncate the visible CPU range.
+WINE_MACOS_EFFICIENCY_CLASS=0 is an explicit opt-out.
+
+---
+ dlls/ntdll/unix/system.c | 53 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index 2ba47d3ccf1..55d946319d2 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -1376,6 +1376,59 @@ static NTSTATUS create_logical_proc_info(void)
+     TRACE("%u logical CPUs from %u physical cores across %u packages\n",
+             lcpu_no, cores_no, pkgs_no);
+ 
++    /*
++     * Windows defines a larger EfficiencyClass as faster and less energy efficient.
++     * The perf-level sysctls identify the two classes, but Apple does not publicly
++     * guarantee CPU-number ordering.  Only use the ordering validated on this exact
++     * 10-core Mac16,13; unknown, restricted, or future topologies stay homogeneous.
++     */
++    {
++        const char *enable = getenv("WINE_MACOS_EFFICIENCY_CLASS");
++        char model[64] = {0}, performance_name[32] = {0}, efficiency_name[32] = {0};
++        unsigned int nlevels = 0, performance_count = 0, efficiency_count = 0;
++        unsigned int physical_count = 0, logical_count = 0;
++        BOOL valid = !enable || strcmp(enable, "0");
++
++        if (getenv("WINENCPU")) valid = FALSE;
++
++        size = sizeof(model);
++        if (valid && sysctlbyname("hw.model", model, &size, NULL, 0)) valid = FALSE;
++        size = sizeof(nlevels);
++        if (valid && sysctlbyname("hw.nperflevels", &nlevels, &size, NULL, 0)) valid = FALSE;
++        size = sizeof(performance_name);
++        if (valid && sysctlbyname("hw.perflevel0.name", performance_name, &size, NULL, 0)) valid = FALSE;
++        size = sizeof(efficiency_name);
++        if (valid && sysctlbyname("hw.perflevel1.name", efficiency_name, &size, NULL, 0)) valid = FALSE;
++        size = sizeof(performance_count);
++        if (valid && sysctlbyname("hw.perflevel0.physicalcpu", &performance_count, &size, NULL, 0)) valid = FALSE;
++        size = sizeof(efficiency_count);
++        if (valid && sysctlbyname("hw.perflevel1.physicalcpu", &efficiency_count, &size, NULL, 0)) valid = FALSE;
++        size = sizeof(physical_count);
++        if (valid && sysctlbyname("hw.physicalcpu", &physical_count, &size, NULL, 0)) valid = FALSE;
++        size = sizeof(logical_count);
++        if (valid && sysctlbyname("hw.logicalcpu", &logical_count, &size, NULL, 0)) valid = FALSE;
++
++        valid = valid && !strcmp(model, "Mac16,13") && nlevels == 2 &&
++                !strcmp(performance_name, "Performance") &&
++                !strcmp(efficiency_name, "Efficiency") &&
++                performance_count == 4 && efficiency_count == 6 &&
++                physical_count == 10 && logical_count == 10 &&
++                cores_no == 10 && lcpu_no == 10;
++
++        if (valid)
++        {
++            performance_cores_capacity = (cores_no + 31) / 32;
++            if ((performance_cores = calloc(performance_cores_capacity, sizeof(*performance_cores))))
++            {
++                for (i = efficiency_count; i < cores_no; i++)
++                    performance_cores[i / 32] |= 1u << (i % 32);
++                TRACE("%u efficiency cores, %u performance cores\n",
++                        efficiency_count, performance_count);
++            }
++            else performance_cores_capacity = 0;
++        }
++    }
++
+     lcpu_per_core = lcpu_no / cores_no;
+     cores_per_package = cores_no / pkgs_no;
+ 
+-- 
+2.50.1

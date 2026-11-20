@@ -1,0 +1,162 @@
+--- a/dlls/ntdll/unix/syscall.c	2026-10-13 01:08:29
++++ b/dlls/ntdll/unix/syscall.c	2026-10-17 22:34:14
+@@ -26,6 +26,10 @@
+ 
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <pthread.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #include "windef.h"
+@@ -278,12 +282,107 @@
+     KeServiceDescriptorTable[index].ArgumentTable = arguments;
+     return TRUE;
+ }
++
++/* deadlock-gptk: WINE_SYSCALL_COUNT=<file> turns the syscall trace hook into a counter: every
++ * 10 s the syscalls per second (all threads and the thread named MainThrd) go to <file>. */
++/* per thread class: 0 all, 1 MainThrd, 2 AudioMixer, 3 dxmt-encode-thr, 4 D3D11RenderThread */
++static LONG syscall_counts_by[5][4][4096];
++static ULONGLONG syscall_count_last;
++
++int syscall_count_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0) enabled = getenv( "WINE_SYSCALL_COUNT" ) != NULL;
++    return enabled;
++}
++
++static void syscall_count_report( ULONGLONG now )
++{
++    static const char *nonames[1];
++    char path[1024];
++    FILE *f;
++    snprintf( path, sizeof(path), "%s.%d", getenv( "WINE_SYSCALL_COUNT" ), (int)getpid() );
++    f = fopen( path, "a" );
++    double secs = (now - syscall_count_last) / 1e7;
++    struct { UINT id; LONG n, c[4]; } top[24];
++    int ntop = 0;
++    LONG total = 0, total_main = 0;
+ 
++    if (!f) return;
++    for (UINT idx = 0; idx < 4; idx++)
++        for (UINT num = 0; num < 4096; num++)
++        {
++            LONG n = InterlockedExchange( &syscall_counts_by[0][idx][num], 0 ), c[4];
++            int k, b;
++            for (b = 0; b < 4; b++) c[b] = InterlockedExchange( &syscall_counts_by[b + 1][idx][num], 0 );
++            total += n; total_main += c[0];
++            if (!n) continue;
++            for (k = ntop; k > 0 && top[k - 1].n < n; k--) if (k < 24) top[k] = top[k - 1];
++            if (k < 24)
++            {
++                top[k].id = (idx << 12) | num; top[k].n = n;
++                for (b = 0; b < 4; b++) top[k].c[b] = c[b];
++                if (ntop < 24) ntop++;
++            }
++        }
++    fprintf( f, "== %.1f s: %.0f syscalls/s, MainThrd %.0f/s   columns: all main audio encode render\n",
++             secs, total / secs, total_main / secs );
++    for (int k = 0; k < ntop; k++)
++    {
++        UINT idx = (top[k].id >> 12) & 3, num = top[k].id & 0xfff;
++        const char **names = syscall_names[idx] ? syscall_names[idx] : nonames;
++        fprintf( f, "  %-34s %9.0f %9.0f %8.0f %8.0f %8.0f\n", top[k].id == ((3 << 12) | 0xff0) ? "unix:system_time_precise" :
++                 names == nonames || !names[num] ? "?" : names[num],
++                 top[k].n / secs, top[k].c[0] / secs, top[k].c[1] / secs, top[k].c[2] / secs, top[k].c[3] / secs );
++    }
++    fclose( f );
++}
++
++static void syscall_count( UINT id )
++{
++    static __thread int cls = -1;
++    static __thread unsigned int calls;
++    UINT idx = (id >> 12) & 3, num = id & 0xfff;
++    LARGE_INTEGER now;
++
++    if (cls < 0 || !(calls & 4095))
++    {
++        char name[64] = "";
++        pthread_getname_np( pthread_self(), name, sizeof(name) );
++        cls = !strcmp( name, "MainThrd" ) ? 1 : !strcmp( name, "AudioMixer" ) ? 2 :
++              !strcmp( name, "dxmt-encode-thr" ) ? 3 : !strcmp( name, "D3D11RenderThread" ) ? 4 : 0;
++    }
++    calls++;
++    InterlockedIncrement( &syscall_counts_by[0][idx][num] );
++    if (cls) InterlockedIncrement( &syscall_counts_by[cls][idx][num] );
++    if (!(calls & 1023))
++    {
++        ULONGLONG last = syscall_count_last;
++        NtQuerySystemTime( &now );
++        if (!last) InterlockedCompareExchange64( (LONG64 *)&syscall_count_last, now.QuadPart, 0 );
++        else if (now.QuadPart - last > 100000000 &&
++                 InterlockedCompareExchange64( (LONG64 *)&syscall_count_last, now.QuadPart, last ) == last)
++        {
++            syscall_count_last = last;
++            syscall_count_report( now.QuadPart );
++            syscall_count_last = now.QuadPart;
++        }
++    }
++}
++
++/* unix calls reported in the same table under a pseudo id */
++void syscall_count_unix( UINT pseudo )
++{
++    syscall_count( (3 << 12) | (0xff0 + pseudo) );
++}
++
+ void trace_syscall( UINT id, ULONG_PTR *args, ULONG len )
+ {
+     UINT idx = (id >> 12) & 3, num = id & 0xfff;
+     const char **names = syscall_names[idx];
+ 
++    if (syscall_count_enabled()) { syscall_count( id ); return; }
++
+     if (names && names[num])
+         TRACE( "\1SysCall  %s(", names[num] );
+     else
+@@ -303,6 +402,8 @@
+     UINT idx = (id >> 12) & 3, num = id & 0xfff;
+     const char **names = syscall_names[idx];
+ 
++    if (syscall_count_enabled()) return;
++
+     if (names && names[num])
+         TRACE( "\1SysRet   %s() retval=%08lx\n", names[num], retval );
+     else
+--- a/dlls/ntdll/unix/server.c	2026-10-13 01:08:29
++++ b/dlls/ntdll/unix/server.c	2026-10-17 21:41:04
+@@ -1583,7 +1583,7 @@
+     struct teb_data *teb_data = get_teb_data( data );
+ 
+     teb_data->syscall_table = KeServiceDescriptorTable;
+-    teb_data->syscall_trace = TRACE_ON(syscall);
++    teb_data->syscall_trace = TRACE_ON(syscall) || syscall_count_enabled();
+ }
+ 
+ 
+--- a/dlls/ntdll/unix/unix_private.h	2026-10-17 21:41:04
++++ b/dlls/ntdll/unix/unix_private.h	2026-10-17 22:33:57
+@@ -244,6 +244,8 @@
+ extern ULONG_PTR redirect_arm64ec_rva( void *module, ULONG_PTR rva, const IMAGE_ARM64EC_METADATA *metadata );
+ extern void start_server( BOOL debug );
+ 
++extern int syscall_count_enabled(void);
++extern void syscall_count_unix( UINT pseudo );
+ extern unsigned int server_call_unlocked( void *req_ptr );
+ extern void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
+ extern void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
+--- a/dlls/ntdll/unix/sync.c	2026-10-13 01:08:29
++++ b/dlls/ntdll/unix/sync.c	2026-10-17 22:33:57
+@@ -2747,6 +2747,7 @@
+  */
+ NTSTATUS system_time_precise( void *args )
+ {
++    if (syscall_count_enabled()) syscall_count_unix( 0 );
+     LONGLONG *ret = args;
+     struct timeval now;
+ #ifdef HAVE_CLOCK_GETTIME

@@ -1,0 +1,74 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2324,6 +2324,11 @@
+     ULONG_PTR cur_gsbase = 0;
+ 
+     if (!data->teb) return FALSE;
++#ifdef __APPLE__
++    /* gsbase is the pthread TSD here (TEB fields mirrored into it) and nothing ever switches it, so a %gs: fault
++       is a real access violation; treating it as "fixed" re-ran the instruction forever */
++    return FALSE;
++#endif
+     if (CS_sig(ucontext) != cs64_sel) return FALSE;
+     if (((ERROR_sig(ucontext) >> 1) & 0x09) == EXCEPTION_EXECUTE_FAULT) return FALSE;
+ 
+@@ -2813,7 +2818,8 @@
+     }
+ #endif
+ 
+-    frame->rip = RIP_sig(sigcontext) + 0xb;
++    /* +0xb pre-compensates the Legends of Runeterra return hack in the dispatcher: only when that is on */
++    frame->rip = RIP_sig(sigcontext) + (wine_syscall_ret_hack ? 0xb : 0);
+     frame->rcx = RIP_sig(sigcontext);
+     frame->eflags = EFL_sig(sigcontext);
+     frame->restore_flags = 0;
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -1199,7 +1199,10 @@
+ 
+     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+     if ((sync = get_cached_inproc_sync( handle )))
++    {
+         release_inproc_sync( sync );  /* already cached (shouldn't happen for a new handle) */
++        release_inproc_sync( stack ); /* and the create reply's reference is not needed */
++    }
+     else
+     {
+         sync = cache_inproc_sync( handle, stack );
+@@ -1243,6 +1246,9 @@
+             inproc.closed = 0;
+             have_inproc = TRUE;
+         }
++        /* the server grabbed the msync object for every create_event under msync: drop it when not used */
++        else if (*handle && reply->inproc_valid && do_msync())
++            msync_close( reply->shm_idx );
+     }
+     SERVER_END_REQ;
+ 
+@@ -2727,10 +2733,10 @@
+             when = now.QuadPart - when;
+         }
+ 
+-        /* Note that we yield after establishing the desired timeout, but
+-           we only care about the result of the yield for zero timeouts */
+-        status = NtYieldExecution();
+-        if (!when) return status;
++        /* deadlock-gptk: only Sleep(0) yields. A yield before a real sleep is pointless (the sleep gives up the
++           core anyway), and on XNU sched_yield depresses the thread's priority for up to 10 ms first - the
++           game's fps limiter sleeps like this on its main thread. */
++        if (!when) return NtYieldExecution();
+ 
+         for (;;)
+         {
+@@ -2740,9 +2746,8 @@
+             if (diff <= 0) break;
+ #if defined(__APPLE__) && defined(HAVE_KQUEUE)
+             {
+-                int r = precise_sleep( diff );
+-                if (r > 0) break;
+-                if (r == 0) continue;
++                /* timer fired (or a stale one after EINTR): re-check the clock instead of trusting it */
++                if (precise_sleep( diff ) >= 0) continue;
+             }
+ #endif
+             tv.tv_sec  = diff / 1000000;

@@ -1,0 +1,1790 @@
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/avrt/main.c b-wine/dlls/avrt/main.c
+--- a/dlls/avrt/main.c
++++ b/dlls/avrt/main.c
+@@ -27,6 +27,19 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(avrt);
+ 
++/* deadlock-gptk: Windows' MMCSS boosts registered threads ("Pro Audio", "Audio", "Games").
++ * Map them to thread priorities, which wineserver turns into macOS QoS / time-constraint
++ * scheduling, instead of leaving game audio threads at normal priority. WINE_MMCSS=0: off. */
++static int mmcss_priority(const WCHAR *name)
++{
++    WCHAR env[8];
++    if (GetEnvironmentVariableW(L"WINE_MMCSS", env, ARRAY_SIZE(env)) && env[0] == '0') return THREAD_PRIORITY_ERROR_RETURN;
++    if (!wcsicmp(name, L"Pro Audio") || !wcsicmp(name, L"Audio") || !wcsicmp(name, L"Capture") ||
++        !wcsicmp(name, L"Playback")) return THREAD_PRIORITY_TIME_CRITICAL;
++    if (!wcsicmp(name, L"Games") || !wcsicmp(name, L"Window Manager")) return THREAD_PRIORITY_HIGHEST;
++    return THREAD_PRIORITY_ERROR_RETURN;
++}
++
+ static inline WCHAR *strdupAW(const char *src)
+ {
+     int len;
+@@ -70,6 +83,11 @@
+         return NULL;
+     }
+ 
++    {
++        int prio = mmcss_priority(name);
++        if (prio != THREAD_PRIORITY_ERROR_RETURN && SetThreadPriority(GetCurrentThread(), prio))
++            TRACE("%s: thread priority %d\n", debugstr_w(name), prio);
++    }
+     return (HANDLE)0x12345678;
+ }
+ 
+@@ -82,6 +100,7 @@
+ BOOL WINAPI AvRevertMmThreadCharacteristics(HANDLE AvrtHandle)
+ {
+     FIXME("(%p): stub\n", AvrtHandle);
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+     return TRUE;
+ }
+ 
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/d3d9/d3d9_main.c b-wine/dlls/d3d9/d3d9_main.c
+--- a/dlls/d3d9/d3d9_main.c
++++ b/dlls/d3d9/d3d9_main.c
+@@ -226,7 +226,11 @@
+ {
+     TRACE("color 0x%08lx, name %s.\n", color, debugstr_w(name));
+ 
+-    return D3DPERF_event_level++;
++    /* deadlock-gptk (as in our Rosetta winecx tree): Windows' d3d9 returns a negative value when no profiler
++     * (PIX/Nsight) is attached. Source 2's PIX check ("TestActive") treats >= 0 as an attached profiler and then
++     * skips its vendor extensions (NvAPI: DLSS and NVIDIA Reflex, AMD AGS/Anti-Lag 2). */
++    D3DPERF_event_level++;
++    return -1;
+ }
+ 
+ /***********************************************************************
+@@ -235,7 +239,8 @@
+ int WINAPI D3DPERF_EndEvent(void) {
+     TRACE("(void) : stub\n");
+ 
+-    return --D3DPERF_event_level;
++    --D3DPERF_event_level;
++    return -1;
+ }
+ 
+ /***********************************************************************
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/ntdll/sync.c b-wine/dlls/ntdll/sync.c
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -829,7 +829,8 @@
+     DWORD tid;
+ };
+ 
+-struct futex_queue
++/* one queue per 128-byte cache line (Apple Silicon): threads waiting on different addresses don't share a line */
++struct DECLSPEC_ALIGN(128) futex_queue
+ {
+     struct list queue;
+     LONG lock;
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/ntdll/unix/server.c b-wine/dlls/ntdll/unix/server.c
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1728,7 +1728,8 @@
+ #ifdef __APPLE__
+                 /* neutron: msync, the inproc device is the shared object memory */
+                 msync_shm = mmap( NULL, MSYNC_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, inproc_device_fd, 0 );
+-                if (msync_shm == MAP_FAILED || ((struct msync_header *)msync_shm)->magic != MSYNC_MAGIC)
++                if (msync_shm == MAP_FAILED || ((struct msync_header *)msync_shm)->magic != MSYNC_MAGIC ||
++                    ((struct msync_header *)msync_shm)->version != MSYNC_VERSION)
+                     fatal_error( "cannot map the msync shared memory\n" );
+                 msync_init_client();
+ #endif
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/ntdll/unix/sync.c b-wine/dlls/ntdll/unix/sync.c
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2742,10 +2742,10 @@
+             when = now.QuadPart - when;
+         }
+ 
+-        /* Note that we yield after establishing the desired timeout, but
+-           we only care about the result of the yield for zero timeouts */
+-        status = NtYieldExecution();
+-        if (!when) return status;
++        /* deadlock-gptk (winecx patch 0032): only Sleep(0) yields. A yield before a real sleep is pointless (the
++           sleep gives up the core anyway), and on XNU sched_yield depresses the thread's priority for up to 10 ms
++           first - the game's fps limiter sleeps like this on its main thread. */
++        if (!when) return NtYieldExecution();
+ 
+         for (;;)
+         {
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/ntdll/unix/system.c b-wine/dlls/ntdll/unix/system.c
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -1372,6 +1372,29 @@
+     TRACE("%u logical CPUs from %u physical cores across %u packages\n",
+             lcpu_no, cores_no, pkgs_no);
+ 
++    /* deadlock-gptk: Apple silicon has performance and efficiency cores (hw.perflevel0 = P,
++     * hw.perflevel1 = E; the E cores have the lower CPU numbers). Report them through
++     * EfficiencyClass like the Linux path does, so games can tell them apart (Source 2 otherwise
++     * sizes its job pool for 10 equal cores and puts work on the slow ones). */
++    {
++        unsigned int nlevels = 0, ecores = 0;
++        size = sizeof(nlevels);
++        if (!sysctlbyname("hw.nperflevels", &nlevels, &size, NULL, 0) && nlevels == 2)
++        {
++            size = sizeof(ecores);
++            if (!sysctlbyname("hw.perflevel1.physicalcpu", &ecores, &size, NULL, 0) && ecores < cores_no)
++            {
++                performance_cores_capacity = (cores_no + 31) / 32;
++                if ((performance_cores = calloc(performance_cores_capacity, sizeof(ULONG))))
++                {
++                    for (i = ecores; i < cores_no; i++) performance_cores[i / 32] |= 1u << (i % 32);
++                    TRACE("%u efficiency cores, %u performance cores\n", ecores, cores_no - ecores);
++                }
++                else performance_cores_capacity = 0;
++            }
++        }
++    }
++
+     lcpu_per_core = lcpu_no / cores_no;
+     cores_per_package = cores_no / pkgs_no;
+ 
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/ntdll/unix/virtual.c b-wine/dlls/ntdll/unix/virtual.c
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2550,6 +2550,24 @@
+  * Decommit some pages of a given view.
+  * virtual_mutex must be held by caller.
+  */
++/* deadlock-gptk: with host pages larger than Windows pages (16K on macOS arm64) a decommitted
++ * 4K page inside a host page that stays mapped keeps its old contents, but Windows hands out
++ * recommitted pages zeroed (allocators rely on it; Deadlock's renderer crashed on a stale node).
++ * Zero those partial pieces; the host page is made writable for that (other permissions kept). */
++static void zero_partial_host_pages( char *start, char *end )
++{
++    while (start < end)
++    {
++        char *host = ROUND_ADDR( start, host_page_mask );
++        char *stop = min( end, host + host_page_size );
++        int prot = get_unix_prot( get_host_page_vprot( host ) );
++        if ((prot & (PROT_READ | PROT_WRITE)) == (PROT_READ | PROT_WRITE) ||
++            !mprotect( host, host_page_size, (prot & ~PROT_EXEC) | PROT_READ | PROT_WRITE ))
++            memset( start, 0, stop - start );
++        start = stop;
++    }
++}
++
+ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size )
+ {
+     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
+@@ -2561,8 +2579,18 @@
+     }
+     else host_end = ROUND_ADDR( base + size, host_page_mask );
+ 
++    if (host_page_mask > page_mask)
++    {
++        if (host_start < host_end)
++        {
++            zero_partial_host_pages( base, host_start );
++            zero_partial_host_pages( host_end, base + size );
++        }
++        else zero_partial_host_pages( base, base + size );
++    }
+     if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
+     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
++    if (host_page_mask > page_mask) mprotect_range( base, size, 0, 0 );
+     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
+     return STATUS_SUCCESS;
+ }
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/win32u/d3dkmt.c b-wine/dlls/win32u/d3dkmt.c
+--- a/dlls/win32u/d3dkmt.c
++++ b/dlls/win32u/d3dkmt.c
+@@ -617,6 +617,85 @@
+         *value = KMT_DRIVERVERSION_WDDM_3_1;
+         return STATUS_SUCCESS;
+     }
++    /* deadlock-gptk: adapter queries as in CrossOver's winecx tree (NVIDIA's NGX loader validates the adapter with
++     * them before it loads the DLSS core) */
++    case KMTQAITYPE_ADAPTERTYPE:
++    {
++        D3DKMT_ADAPTERTYPE *value = desc->pPrivateDriverData;
++
++        if (desc->PrivateDriverDataSize < sizeof(*value))
++            return STATUS_INVALID_PARAMETER;
++
++        memset( value, 0, sizeof(*value) );
++        value->RenderSupported = 1;
++        value->DisplaySupported = 1;
++        return STATUS_SUCCESS;
++    }
++    case KMTQAITYPE_PHYSICALADAPTERCOUNT:
++    {
++        D3DKMT_PHYSICAL_ADAPTER_COUNT *value = desc->pPrivateDriverData;
++
++        if (desc->PrivateDriverDataSize < sizeof(*value))
++            return STATUS_INVALID_PARAMETER;
++
++        value->Count = 1;
++        return STATUS_SUCCESS;
++    }
++    case KMTQAITYPE_ADAPTERADDRESS:
++    {
++        D3DKMT_ADAPTERADDRESS *value = desc->pPrivateDriverData;
++
++        if (desc->PrivateDriverDataSize < sizeof(*value))
++            return STATUS_INVALID_PARAMETER;
++
++        /* There is no PCI bus to report a location on. */
++        memset( value, 0, sizeof(*value) );
++        return STATUS_SUCCESS;
++    }
++    case KMTQAITYPE_ADAPTERGUID:
++    {
++        VkPhysicalDeviceIDProperties id = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
++        VkPhysicalDeviceProperties2 properties2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &id};
++        struct vulkan_physical_device *physical_device;
++        GUID *value = desc->pPrivateDriverData;
++        struct d3dkmt_adapter *adapter;
++
++        if (desc->PrivateDriverDataSize < sizeof(*value))
++            return STATUS_INVALID_PARAMETER;
++
++        if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
++        if (!(physical_device = adapter->physical_device)) return STATUS_INVALID_PARAMETER;
++
++        physical_device->instance->p_vkGetPhysicalDeviceProperties2KHR( physical_device->host.physical_device, &properties2 );
++        memcpy( value, id.deviceUUID, sizeof(*value) );
++        return STATUS_SUCCESS;
++    }
++    case KMTQAITYPE_GETSEGMENTSIZE:
++    {
++        VkPhysicalDeviceMemoryProperties2 properties2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
++        D3DKMT_SEGMENTSIZEINFO *value = desc->pPrivateDriverData;
++        struct vulkan_physical_device *physical_device;
++        struct d3dkmt_adapter *adapter;
++        unsigned int i;
++
++        if (desc->PrivateDriverDataSize < sizeof(*value))
++            return STATUS_INVALID_PARAMETER;
++
++        if (!(adapter = get_d3dkmt_object( desc->hAdapter, D3DKMT_ADAPTER ))) return STATUS_INVALID_PARAMETER;
++        if (!(physical_device = adapter->physical_device)) return STATUS_INVALID_PARAMETER;
++
++        memset( value, 0, sizeof(*value) );
++
++        physical_device->instance->p_vkGetPhysicalDeviceMemoryProperties2KHR( physical_device->host.physical_device, &properties2 );
++        for (i = 0; i < properties2.memoryProperties.memoryHeapCount; ++i)
++        {
++            if (properties2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
++                value->DedicatedVideoMemorySize += properties2.memoryProperties.memoryHeaps[i].size;
++            else
++                value->SharedSystemMemorySize += properties2.memoryProperties.memoryHeaps[i].size;
++        }
++        return STATUS_SUCCESS;
++    }
+     default:
+     {
+         FIXME( "type %d not handled.\n", desc->Type );
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/win32u/sysparams.c b-wine/dlls/win32u/sysparams.c
+--- a/dlls/win32u/sysparams.c
++++ b/dlls/win32u/sysparams.c
+@@ -1171,6 +1171,10 @@
+     case 0x8086: /* Intel */    return "35.0.101.6314";
+     case 0x1002: /* AMD */      return "35.0.21025.1024";
+     case 0x10de: /* Nvidia */   return "35.0.15.6094";
++    /* deadlock-gptk (as in CrossOver's winecx tree): Apple GPUs have no PCI driver revision. The default decodes
++     * to 010.00 under the vendor parsers that keep the last five digits; Deadlock then reports an outdated driver
++     * and turns DLSS off while DXMT presents an NVIDIA GPU. */
++    case 0x106b: /* Apple */    return "35.0.15.6094";
+     default:                    return "35.0.10.1000";
+     }
+ }
+@@ -1771,6 +1775,9 @@
+     unsigned int i;
+     HKEY hkey, subkey;
+     DWORD len;
++    struct pci_id reported;
++    const char *env;
++    unsigned long id;
+ 
+     static const GUID empty_uuid;
+ 
+@@ -1799,9 +1806,19 @@
+     if (!pci_id->vendor && !pci_id->device && vulkan_gpu) pci_id = &vulkan_gpu->pci_id;
+     if (!pci_id->vendor && !pci_id->device && opengl_gpu) pci_id = &opengl_gpu->pci_id;
+ 
++    /* deadlock-gptk (as in CrossOver's winecx tree): D3DM_VENDOR_ID / D3DM_DEVICE_ID / D3DM_DEVICE_DESCRIPTION give
++     * the adapter the identity the D3D layer reports (DXMT with NVIDIA extensions: vendor 0x10DE), so the
++     * DriverVersion and DriverDesc a game reads from the registry beside that adapter agree with it. After the
++     * Vulkan/OpenGL pairing above, which needs the host's ids. */
++    reported = *pci_id;
++    if ((env = getenv( "D3DM_VENDOR_ID" )) && (id = strtoul( env, NULL, 16 ))) reported.vendor = id;
++    if ((env = getenv( "D3DM_DEVICE_ID" )) && (id = strtoul( env, NULL, 16 ))) reported.device = id;
++    pci_id = &reported;
++
+     name = gpu_device_name( pci_id->vendor, pci_id->device, name );
+     if (!strcmp( name, "Wine Adapter" ) && vulkan_gpu) name = vulkan_gpu->name;
+     if (!strcmp( name, "Wine Adapter" ) && opengl_gpu) name = opengl_gpu->name;
++    if ((env = getenv( "D3DM_DEVICE_DESCRIPTION" )) && *env) name = env;
+     RtlUTF8ToUnicodeN( gpu->name, sizeof(gpu->name) - sizeof(WCHAR), &len, name, strlen( name ) );
+ 
+     snprintf( gpu->path, sizeof(gpu->path), "PCI\\VEN_%04X&DEV_%04X&SUBSYS_%08X&REV_%02X\\%08X",
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/winecoreaudio.drv/coreaudio.c b-wine/dlls/winecoreaudio.drv/coreaudio.c
+--- a/dlls/winecoreaudio.drv/coreaudio.c
++++ b/dlls/winecoreaudio.drv/coreaudio.c
+@@ -786,6 +786,21 @@
+     return S_OK;
+ }
+ 
++/* deadlock-gptk: WINE_COREAUDIO_MIN_PERIOD_MS raises the default/stream period to at least
++ * that many milliseconds. Wine takes the device's I/O buffer size as the period, which at
++ * high sample rates (96 kHz) is ~5 ms and underruns while a game loads the CPU. */
++static unsigned int env_min_period_frames(unsigned int rate)
++{
++    static int ms = -1;
++    if (ms < 0)
++    {
++        const char *env = getenv("WINE_COREAUDIO_MIN_PERIOD_MS");
++        ms = env ? atoi(env) : 0;
++        if (ms < 0 || ms > 100) ms = 0;
++    }
++    return ms ? muldiv(ms, rate, 1000) : 0;
++}
++
+ static NTSTATUS unix_create_stream(void *args)
+ {
+     struct create_stream_params *params = args;
+@@ -825,6 +840,7 @@
+                                                               &max_period_frames)))
+         goto end;
+ 
++    stream->period_frames = max(stream->period_frames, env_min_period_frames(stream->fmt->nSamplesPerSec));
+     stream->period_frames = max(min_period_frames, min(stream->period_frames, max_period_frames));
+     stream->period = muldiv(stream->period_frames, 10000000, stream->fmt->nSamplesPerSec);
+     if (FAILED(params->result = set_device_period_frame_size(stream->dev_id, stream->flow, stream->period_frames)))
+@@ -1164,6 +1180,17 @@
+     if(FAILED(params->result = get_device_sample_rate(dev_id, params->flow, &params->fmt->Format.nSamplesPerSec)))
+         return STATUS_SUCCESS;
+ 
++    /* deadlock-gptk: WINE_COREAUDIO_MIX_RATE=<Hz> reports that rate as the shared-mode mix format
++     * for playback. Games mix at the mix-format rate; at a 96 kHz device that doubles their (here:
++     * Rosetta-translated) mixing work. The output AudioUnit converts to the device rate natively,
++     * so the device itself keeps its rate. */
++    if(params->flow == eRender){
++        const char *env = getenv("WINE_COREAUDIO_MIX_RATE");
++        unsigned int rate = env ? strtoul(env, NULL, 10) : 0;
++        if(rate >= 8000 && rate <= 384000 && rate < params->fmt->Format.nSamplesPerSec)
++            params->fmt->Format.nSamplesPerSec = rate;
++    }
++
+     params->fmt->Format.wBitsPerSample = 32;
+     params->fmt->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+ 
+@@ -1213,6 +1240,7 @@
+         if (FAILED(params->result = get_device_period_frame_size(dev_id, params->flow, &period_frames)))
+             return STATUS_SUCCESS;
+ 
++        period_frames = max(period_frames, env_min_period_frames(n_samples_per_sec));
+         *params->def_period = muldiv(period_frames, 10000000, n_samples_per_sec);
+     }
+ 
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/wined3d/directx.c b-wine/dlls/wined3d/directx.c
+--- a/dlls/wined3d/directx.c
++++ b/dlls/wined3d/directx.c
+@@ -922,9 +922,23 @@
+     if ((version_info = get_driver_version_info(driver, driver_model))
+             || (version_info = get_driver_version_info(driver, DRIVER_MODEL_GENERIC)))
+     {
++        char env[64];
++        unsigned int a, b, c, d;
++
+         driver_info->name = version_info->driver_name;
+         driver_info->version_high = MAKEDWORD_VERSION(driver_os_version, driver_feature_level);
+         driver_info->version_low = MAKEDWORD_VERSION(version_info->subversion, version_info->build);
++
++        /* deadlock-gptk (as in the Rosetta winecx tree): WINE_DRIVER_VERSION=a.b.c.d overrides the reported driver
++         * version. Games that see an NVIDIA vendor reject the fallback profile's "old driver" (Deadlock: below
++         * 32.0.15.8108 disables DLSS and async shader creation). */
++        if (GetEnvironmentVariableA("WINE_DRIVER_VERSION", env, sizeof(env))
++                && sscanf(env, "%u.%u.%u.%u", &a, &b, &c, &d) == 4)
++        {
++            driver_info->version_high = MAKEDWORD_VERSION(a, b);
++            driver_info->version_low = MAKEDWORD_VERSION(c, d);
++            TRACE("Driver version overridden to %s.\n", debugstr_a(env));
++        }
+ 
+         return true;
+     }
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/winemac.drv/cocoa_app.m b-wine/dlls/winemac.drv/cocoa_app.m
+--- a/dlls/winemac.drv/cocoa_app.m
++++ b/dlls/winemac.drv/cocoa_app.m
+@@ -115,8 +115,820 @@
+ @end
+ 
+ 
++/* deadlock-gptk: WINE_MAC_WHEEL_GATE=<ms> - in mouse-look (the client hides and clips the cursor) one wheel flick is
++ * one notch: a vertical scroll event within <ms> of the previous one in the same direction is dropped (every event
++ * extends the window), a kept one is exactly one WHEEL_DELTA. macOS sends several accelerated events per flick, so a
++ * wheel bound to jump also air-jumped (the XMBC "ignore repeated scroll" fix on Windows). Cursor visible (menus,
++ * shop): unchanged. */
++static double wheel_gate_ms(void)
++{
++    static double ms = -1;
++    if (ms < 0)
++    {
++        const char *s = getenv("WINE_MAC_WHEEL_GATE");
++        ms = s && *s ? atof(s) : 0;
++        if (ms < 0) ms = 0;
++    }
++    return ms;
++}
++
++static NSTimeInterval wheel_gate_last;
++static int wheel_gate_dir;
++
++/* deadlock-gptk: WINE_MAC_WHEEL_REPRESS=<mac keycode>[:up|:down][:<ms>] (e.g. 49:up:25 = Space, wheel up, 25 ms) - in
++ * mouse-look, a wheel notch (kept by the gate, in that direction) while that key is physically held becomes a fresh
++ * press of the key: release now, press again <ms> later (more than a game tick, so the game sees the key go up and
++ * down), and the notch itself is dropped. For a key and wheel on the same action (Deadlock: Jump on SPACE +
++ * MWHEELUP) the wheel then works no matter how long the key is held; afterwards the key is down again, as it
++ * physically is. An immediate release + notch landed in one game tick and was no new press. */
++static int wheel_repress_key = -2, wheel_repress_dir, wheel_repress_ms;
++
++static void wheel_repress_init(void)
++{
++    const char *s;
++    char *end;
++
++    if (wheel_repress_key != -2) return;
++    wheel_repress_key = -1;
++    wheel_repress_dir = 0;
++    wheel_repress_ms = 25;
++    if (!(s = getenv("WINE_MAC_WHEEL_REPRESS")) || !*s) return;
++    wheel_repress_key = strtol(s, &end, 0);
++    if (!strncmp(end, ":up", 3)) { wheel_repress_dir = 1; end += 3; }
++    else if (!strncmp(end, ":down", 5)) { wheel_repress_dir = -1; end += 5; }
++    if (*end == ':') wheel_repress_ms = atoi(end + 1);
++    if (wheel_repress_key < 0 || wheel_repress_key > 127) wheel_repress_key = -1;
++}
++
++/* physical key state from the key events Wine receives (CGEventSourceKeyState of the HID state can need Input
++ * Monitoring permission); main thread only, like the scroll handler */
++static unsigned char wheel_keys_down[128];
++static NSTimeInterval wheel_keys_press_time[128];   /* last non-repeat press, NSEvent timestamp (uptime) */
++static BOOL wheel_pending;                          /* a delayed wheel jump is queued */
++
++/* deadlock-gptk: WINE_MAC_WHEEL_RAW_AFTER_PAIR=<pair ms>[:<window ms>] (default off; the launchers set 400:1500) - two
++ * presses of the WINE_MAC_WHEEL_REPRESS key less than <pair ms> apart (Deadlock: Space-Space = jump + air jump) make
++ * the wheel raw for <window ms> after the second press: in that direction every scroll event is a notch (no gate)
++ * and none is held back (no WINE_MAC_WHEEL_AFTER_KEY_MS), for wall jumps at full wheel speed. A single press of
++ * the key ends it (Space -> wheel keeps its hold). A held key is still re-pressed. */
++static double wheel_raw_pair_ms = -1, wheel_raw_window_ms;
++static NSTimeInterval wheel_raw_until;
++
++static void wheel_raw_init(void)
++{
++    const char *s;
++    char *end;
++
++    if (wheel_raw_pair_ms >= 0) return;
++    wheel_raw_pair_ms = 0;
++    wheel_raw_window_ms = 1500;
++    if (!(s = getenv("WINE_MAC_WHEEL_RAW_AFTER_PAIR")) || !*s) return;
++    wheel_raw_pair_ms = strtod(s, &end);
++    if (*end == ':') wheel_raw_window_ms = atof(end + 1);
++    if (wheel_raw_pair_ms < 0) wheel_raw_pair_ms = 0;
++}
++
++void macdrv_wheel_note_key(unsigned short keycode, int pressed, int repeat, double timestamp)
++{
++    if (keycode >= sizeof(wheel_keys_down)) return;
++    wheel_keys_down[keycode] = pressed != 0;
++    if (pressed && !repeat)
++    {
++        double apart = (timestamp - wheel_keys_press_time[keycode]) * 1000;
++
++        wheel_repress_init();
++        wheel_raw_init();
++        if (keycode == wheel_repress_key && apart < wheel_raw_pair_ms)
++        {
++            wheel_raw_until = timestamp + wheel_raw_window_ms / 1000;
++            macdrv_wheel_log("key %d pressed twice %.0f ms apart: wheel raw for %.0f ms\n", keycode, apart,
++                             wheel_raw_window_ms);
++        }
++        else if (keycode == wheel_repress_key && wheel_raw_until > timestamp)
++        {
++            wheel_raw_until = 0;
++            macdrv_wheel_log("key %d pressed once: wheel raw off\n", keycode);
++        }
++        wheel_keys_press_time[keycode] = timestamp;
++    }
++}
++
++/* deadlock-gptk: WINE_MAC_WHEEL_AFTER_KEY_MS=<ms> (default 0 = off; the launchers set 160) - a wheel notch less than
++ * <ms> after the last press of the WINE_MAC_WHEEL_REPRESS key is held back until <ms> after that press. Deadlock's
++ * Jump ability has a 0.15 s cooldown (scripts/abilities.vdata citadel_ability_jump AbilityCooldown), so a wheel jump
++ * 60-140 ms after Space was ignored; now it lands just after the cooldown. One notch is still one press. */
++static double wheel_after_key_ms(void)
++{
++    static double ms = -1;
++    if (ms < 0)
++    {
++        const char *s = getenv("WINE_MAC_WHEEL_AFTER_KEY_MS");
++        ms = s && *s ? atof(s) : 0;
++        if (ms < 0) ms = 0;
++    }
++    return ms;
++}
++
++static void wheel_post_scroll(WineWindow *window, int x, int y, int y_scroll)
++{
++    macdrv_event *event = macdrv_create_event(MOUSE_SCROLL, window);
++
++    event->mouse_scroll.x = x;
++    event->mouse_scroll.y = y;
++    event->mouse_scroll.y_scroll = y_scroll;
++    event->mouse_scroll.look = 1;
++    event->mouse_scroll.time_ms = [[WineApplicationController sharedController]
++                                   ticksForEventTime:[[NSProcessInfo processInfo] systemUptime]];
++    [window.queue postEvent:event];
++    macdrv_release_event(event);
++}
++
++static void wheel_post_key(WineWindow *window, CGKeyCode key, BOOL pressed, CGEventFlags modifiers)
++{
++    macdrv_event *event = macdrv_create_event(pressed ? KEY_PRESS : KEY_RELEASE, window);
++
++    event->key.keycode = key;
++    event->key.modifiers = modifiers;
++    event->key.time_ms = [[WineApplicationController sharedController]
++                          ticksForEventTime:[[NSProcessInfo processInfo] systemUptime]];
++    [window.queue postEvent:event];
++    macdrv_release_event(event);
++}
++
++/* deadlock-gptk: WINE_MAC_WHEEL_LOG=<unix path> - one line per wheel notch and per press/release of the
++ * WINE_MAC_WHEEL_RELEASE key: what the gate and the release did (diagnostics, a few lines per jump). */
++#include <stdarg.h>
++void macdrv_wheel_log(const char *fmt, ...)
++{
++    static FILE *f;
++    static int init;
++    va_list args;
++
++    if (!init)
++    {
++        const char *path = getenv("WINE_MAC_WHEEL_LOG");
++        init = 1;
++        if (path && *path && (f = fopen(path, "a"))) setvbuf(f, NULL, _IOLBF, 0);
++    }
++    if (!f) return;
++    va_start(args, fmt);
++    vfprintf(f, fmt, args);
++    va_end(args);
++}
++
++/* deadlock-gptk: WINE_MAC_PARKOUR=<unix path of the game's citadel folder> (./deadlock.sh --parkour, which also starts
++ * the game with +exec dl_parkour_init = bind F9 "exec dl_parkour") - practice helpers for maps with sv_cheats, in
++ * mouse-look only (menus, chat and console get the keys as usual):
++ *   Q  checkpoint: runs "getpos_exact", keeps its "setpos_exact ...;setang_exact ..." reply from console.log (-condebug)
++ *   E  teleport to the checkpoint, WINE_MAC_PARKOUR_LIFT (16) units higher: setpos_exact turns noclip on when the
++ *      spot counts as stuck, which a spot on the floor (and 2 units above it) did; "noclip 0" after it in case. Optional
++ *      WINE_MAC_PARKOUR_REFRESH (e.g. "citadel_rapid_stamina_regen 1") and WINE_MAC_PARKOUR_REFRESH_OFF
++ *      WINE_MAC_PARKOUR_REFRESH_MS (1000) later. Restarts the stopwatch. E also reaches the game (Interact: the
++ *      hideout's portals), so without a checkpoint it is only Interact
++ *   T  stopwatch start / stop; a stop adds the time as a row below the previous ones
++ *   H  clear the rows and stop the stopwatch; with nothing left to clear, forget the checkpoint (E = Interact only)
++ * Q, T and H don't reach the game. A command runs by writing it to cfg/dl_parkour.cfg and pressing F9 for the game
++ * (Deadlock's release build doesn't open a net console for -netconport). The overlay is a click-through panel of this
++ * process above the game window, shown only while it has something on it. Main thread, except reading console.log. */
++#include <sys/stat.h>
++#include <unistd.h>
++
++enum { PARKOUR_KEY_Q = 12, PARKOUR_KEY_E = 14, PARKOUR_KEY_T = 17, PARKOUR_KEY_H = 4, PARKOUR_KEY_EXEC = 101 /* F9 */ };
++
++static int parkour_on = -1;
++static char parkour_cfg[1024], parkour_log[1024], parkour_map_cfg[1024];
++static int parkour_map_state;                /* map reload: 0 not yet, 1 scheduled, 2 done or nothing to do */
++static const char *parkour_refresh, *parkour_refresh_off;
++static double parkour_refresh_ms, parkour_lift;
++static BOOL parkour_off_pending;             /* the refresh-off command is still to run */
++static dispatch_queue_t parkour_queue;
++static NSString *parkour_checkpoint;
++static unsigned parkour_ask_id;              /* the latest Q */
++static unsigned char parkour_swallowed[128];
++static NSMutableArray *parkour_rows;
++static BOOL parkour_running;
++static NSTimeInterval parkour_start;
++static NSString *parkour_status;
++static NSTimeInterval parkour_status_until;
++static NSPanel *parkour_panel;
++static CATextLayer *parkour_rows_layer, *parkour_clock, *parkour_status_layer;
++static NSDictionary *parkour_attrs;
++static dispatch_queue_t parkour_draw_queue;     /* the clock's 10 Hz tick / the frame overlay's renders */
++static dispatch_source_t parkour_tick;
++
++static BOOL parkour_mouselook(void);
++static void parkour_redraw(void);
++
++/* the console channel: WINE_MAC_PARKOUR's folder, else WINE_MAC_CONSOLE (the launchers set it always; it does
++ * nothing unless the game was started with +exec dl_parkour_init, i.e. --parkour or --map) */
++static BOOL parkour_channel(void)
++{
++    static int on;
++    static dispatch_once_t once;
++
++    dispatch_once(&once, ^{
++        const char *dir = getenv("WINE_MAC_PARKOUR");
++
++        if (!dir || !*dir) dir = getenv("WINE_MAC_CONSOLE");
++        on = dir && *dir;
++        if (on)
++        {
++            snprintf(parkour_cfg, sizeof(parkour_cfg), "%s/cfg/dl_parkour.cfg", dir);
++            snprintf(parkour_log, sizeof(parkour_log), "%s/console.log", dir);
++            snprintf(parkour_map_cfg, sizeof(parkour_map_cfg), "%s/cfg/dl_map_reload.cfg", dir);
++        }
++    });
++    return on;
++}
++
++static BOOL parkour_enabled(void)
++{
++    static dispatch_once_t once;
++
++    dispatch_once(&once, ^{
++        const char *dir = getenv("WINE_MAC_PARKOUR");
++        parkour_on = dir && *dir && parkour_channel();
++        if (parkour_on)
++        {
++            const char *ms = getenv("WINE_MAC_PARKOUR_REFRESH_MS"), *lift = getenv("WINE_MAC_PARKOUR_LIFT");
++            parkour_refresh = getenv("WINE_MAC_PARKOUR_REFRESH");
++            if (!parkour_refresh) parkour_refresh = "";
++            parkour_refresh_off = getenv("WINE_MAC_PARKOUR_REFRESH_OFF");
++            if (!parkour_refresh_off) parkour_refresh_off = "";
++            parkour_refresh_ms = ms && *ms ? atof(ms) : 1000;
++            parkour_lift = lift && *lift ? atof(lift) : 16;
++            parkour_queue = dispatch_queue_create("deadlock-gptk.parkour", DISPATCH_QUEUE_SERIAL);
++            parkour_draw_queue = dispatch_queue_create("deadlock-gptk.parkour-draw",
++                dispatch_queue_attr_make_with_autorelease_frequency(DISPATCH_QUEUE_SERIAL,
++                                                                    DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
++            parkour_attrs = [@{ NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:20 weight:NSFontWeightSemibold],
++                                NSForegroundColorAttributeName: [NSColor whiteColor] } retain];
++            parkour_rows = [[NSMutableArray alloc] init];
++        }
++    });
++    return parkour_on;
++}
++
++static void parkour_show_status(NSString *text)
++{
++    [parkour_status release];
++    parkour_status = [text copy];
++    parkour_status_until = [[NSProcessInfo processInfo] systemUptime] + 2.5;
++    parkour_redraw();
++}
++
++/* the game runs <command>: cfg/dl_parkour.cfg (written whole, then renamed) + F9 down, up 30 ms later */
++static BOOL parkour_exec(NSString *command)
++{
++    WineWindow *window = (WineWindow *)[NSApp keyWindow];
++    char tmp[1100];
++    FILE *f;
++
++    if (![window isKindOfClass:[WineWindow class]]) return NO;
++    if (parkour_off_pending)
++    {
++        parkour_off_pending = NO;
++        command = [NSString stringWithFormat:@"%s;%@", parkour_refresh_off, command];
++    }
++    snprintf(tmp, sizeof(tmp), "%s.tmp", parkour_cfg);
++    if (!(f = fopen(tmp, "w")))
++    {
++        macdrv_wheel_log("parkour: can't write %s\n", tmp);
++        return NO;
++    }
++    fprintf(f, "%s\n", [command UTF8String]);
++    fclose(f);
++    if (rename(tmp, parkour_cfg)) return NO;
++    wheel_post_key(window, PARKOUR_KEY_EXEC, TRUE, 0);
++    [window retain];
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
++        wheel_post_key(window, PARKOUR_KEY_EXEC, FALSE, 0);
++        [window release];
++    });
++    return YES;
++}
++
++/* Q: getpos_exact, then up to 2 s of console.log lines for "setpos... setang..." (one line, or setang on the next) */
++static void parkour_ask_position(void)
++{
++    struct stat st;
++    off_t from = stat(parkour_log, &st) ? 0 : st.st_size;
++    unsigned id = ++parkour_ask_id;
++
++    if (!parkour_exec(@"getpos_exact"))
++    {
++        parkour_show_status(@"can't run game commands");
++        return;
++    }
++    dispatch_async(parkour_queue, ^{
++        NSMutableString *found = nil;
++        BOOL done = NO;
++        char line[4096];
++        off_t pos = from;
++        FILE *f = fopen(parkour_log, "r");
++        int i;
++
++        for (i = 0; f && !done && i < 80; i++)
++        {
++            usleep(25000);
++            clearerr(f);
++            if (fseeko(f, pos, SEEK_SET)) break;
++            while (!done && fgets(line, sizeof(line), f))
++            {
++                size_t n = strlen(line);
++                const char *p;
++
++                if (line[n - 1] != '\n' && n < sizeof(line) - 1) break;   /* still being written */
++                pos += n;
++                line[strcspn(line, "\r\n")] = 0;
++                if (!found && (p = strstr(line, "setpos")))
++                {
++                    found = [[NSMutableString alloc] initWithUTF8String:p];
++                    done = found && strstr(p, "setang");
++                }
++                else if (found && (p = strstr(line, "setang")))
++                {
++                    [found appendFormat:@";%s", p];
++                    done = YES;
++                }
++            }
++        }
++        if (f) fclose(f);
++        dispatch_async(dispatch_get_main_queue(), ^{
++            if (id == parkour_ask_id)
++            {
++                double x, y, z;
++                const char *ang;
++
++                if (found && sscanf([found UTF8String], "setpos_exact %lf %lf %lf", &x, &y, &z) == 3 &&
++                    (ang = strchr([found UTF8String], ';')))
++                    [found setString:[NSString stringWithFormat:@"setpos_exact %f %f %f%s", x, y, z + parkour_lift, ang]];
++                if (found)
++                {
++                    [parkour_checkpoint release];
++                    parkour_checkpoint = [found copy];
++                    macdrv_wheel_log("parkour: checkpoint %s\n", [found UTF8String]);
++                    parkour_show_status(@"checkpoint set");
++                }
++                else
++                {
++                    macdrv_wheel_log("parkour: no getpos_exact reply in %s\n", parkour_log);
++                    parkour_show_status(@"no reply - console: exec dl_parkour_init");
++                }
++            }
++            [found release];
++        });
++    });
++}
++
++/* ./deadlock.sh --map: a custom map's own data (its hero) is only in use from its second load, and the load has
++ * to be a finished one (a "map" during loading restarts it). tools/map-cfg.sh writes the command into
++ * cfg/dl_map_reload.cfg; the first mouse-look of the process (the player is in the map: only the game captures the
++ * cursor, and not on the loading screen) runs it once, 2 s later. Called on every mouse move in mouse-look. */
++static void parkour_map_reload_kick(void)
++{
++    if (parkour_map_state || !parkour_channel()) return;
++    parkour_map_state = 1;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++        char line[256] = "";
++        FILE *f = fopen(parkour_map_cfg, "r");
++
++        if (f)
++        {
++            while (fgets(line, sizeof(line), f) && (line[0] == '/' || line[0] == '\n')) line[0] = 0;
++            fclose(f);
++        }
++        line[strcspn(line, "\r\n")] = 0;
++        if (!line[0])
++            parkour_map_state = 2;
++        else if (!parkour_mouselook())
++            parkour_map_state = 0;           /* left mouse-look meanwhile: the next one tries again */
++        else if (parkour_exec([NSString stringWithUTF8String:line]))
++        {
++            parkour_map_state = 2;
++            macdrv_wheel_log("parkour: map reload: %s\n", line);
++        }
++        else
++            parkour_map_state = 0;
++    });
++}
++
++static NSString *parkour_format(double s)
++{
++    if (s < 60) return [NSString stringWithFormat:@"%.3f", s];
++    return [NSString stringWithFormat:@"%d:%06.3f", (int)(s / 60), fmod(s, 60)];
++}
++
++static NSAttributedString *parkour_string(NSString *s)
++{
++    return [[[NSAttributedString alloc] initWithString:s attributes:parkour_attrs] autorelease];
++}
++
++/* the running line: tenths, so 10 updates/s; the row added at stop has milliseconds */
++static NSString *parkour_clock_text(double s)
++{
++    s = floor(s * 10) / 10;
++    if (s < 60) return [NSString stringWithFormat:@" ▶   %.1f", s];
++    return [NSString stringWithFormat:@" ▶   %d:%04.1f", (int)(s / 60), fmod(s, 60)];
++}
++
++/* any thread: Core Animation is thread-safe inside an explicit transaction, so the tick never touches the main
++ * thread (Wine's input thread) */
++static void parkour_set_clock(double elapsed)
++{
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    parkour_clock.string = parkour_string(parkour_clock_text(elapsed));
++    [CATransaction commit];
++}
++
++static CATextLayer *parkour_text_layer(CALayer *parent, CGFloat scale)
++{
++    CATextLayer *layer = [CATextLayer layer];
++
++    layer.contentsScale = scale;
++    layer.anchorPoint = CGPointZero;
++    [parent addSublayer:layer];
++    return layer;
++}
++
++/* --- the overlay inside the game's frame (DXMT, our builds) ---
++ * The panel above was a window over the game, so the window server composited every frame while it showed. DXMT's
++ * present pass instead calls macdrv_parkour_overlay_lock (winemetal, dlsym) for each frame and, when the version
++ * changed, copies the bitmap into a texture it blends over the drawable. The bitmap is rendered here on
++ * parkour_draw_queue: on every change of rows/status/running, and 10x/s while the stopwatch runs. The first call
++ * from DXMT switches the panel off for good. */
++#include <os/lock.h>
++
++static os_unfair_lock parkour_frame_lock = OS_UNFAIR_LOCK_INIT;
++static BOOL parkour_frame_seen;              /* DXMT asked: draw into the frame, no panel */
++static NSString *parkour_frame_rows, *parkour_frame_status;  /* snapshot of the main thread's state */
++static BOOL parkour_frame_running;
++static NSTimeInterval parkour_frame_start;
++static void *parkour_frame_pixels;           /* premultiplied BGRA, top row first */
++static uint32_t parkour_frame_width, parkour_frame_height;
++static uint64_t parkour_frame_version;
++static double parkour_frame_scale = 1, parkour_frame_rendered_scale;
++static dispatch_source_t parkour_frame_tick;
++
++static CTLineRef parkour_frame_line(NSString *text, CTFontRef font)
++{
++    NSAttributedString *s = [[NSAttributedString alloc] initWithString:text
++                                                            attributes:@{ (id)kCTFontAttributeName: (id)font,
++                                                                          (id)kCTForegroundColorFromContextAttributeName: @YES }];
++    CTLineRef line = CTLineCreateWithAttributedString((CFAttributedStringRef)s);
++
++    [s release];
++    return line;
++}
++
++/* parkour_draw_queue */
++static void parkour_frame_render(void)
++{
++    NSString *rows, *status;
++    BOOL running;
++    NSTimeInterval start;
++    double scale;
++    NSMutableArray *texts = [NSMutableArray array];
++    void *pixels = NULL;
++    uint32_t width = 0, height = 0;
++
++    os_unfair_lock_lock(&parkour_frame_lock);
++    rows = [parkour_frame_rows retain];
++    status = [parkour_frame_status retain];
++    running = parkour_frame_running;
++    start = parkour_frame_start;
++    scale = parkour_frame_scale;
++    os_unfair_lock_unlock(&parkour_frame_lock);
++
++    if ([rows length]) [texts addObjectsFromArray:[rows componentsSeparatedByString:@"\n"]];
++    if (running) [texts addObject:parkour_clock_text([[NSProcessInfo processInfo] systemUptime] - start)];
++    if ([status length]) [texts addObject:status];
++
++    if ([texts count])
++    {
++        CTFontRef font = CTFontCreateCopyWithAttributes((CTFontRef)[parkour_attrs objectForKey:NSFontAttributeName],
++                                                        20 * scale, NULL, NULL);
++        CGFloat ascent = CTFontGetAscent(font), descent = CTFontGetDescent(font), leading = CTFontGetLeading(font);
++        CGFloat line_height = ceil(ascent + descent + leading), pad_x = ceil(12 * scale), pad_y = ceil(8 * scale);
++        CGFloat text_width = 0;
++        NSMutableArray *lines = [NSMutableArray array];
++        CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
++        CGContextRef ctx;
++        NSUInteger i;
++
++        if (running)   /* room for minutes: the box doesn't grow while the clock runs */
++        {
++            CTLineRef wide = parkour_frame_line(parkour_clock_text(600), font);
++            text_width = CTLineGetTypographicBounds(wide, NULL, NULL, NULL);
++            CFRelease(wide);
++        }
++        for (NSString *text in texts)
++        {
++            CTLineRef line = parkour_frame_line(text, font);
++            text_width = MAX(text_width, CTLineGetTypographicBounds(line, NULL, NULL, NULL));
++            [lines addObject:(id)line];
++            CFRelease(line);
++        }
++        width = MIN(512, (uint32_t)ceil(text_width + 2 * pad_x));
++        height = MIN(1024, (uint32_t)(line_height * [lines count] + 2 * pad_y));
++        pixels = calloc((size_t)width * height, 4);
++        ctx = CGBitmapContextCreate(pixels, width, height, 8, width * 4, srgb,
++                                    kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
++        if (ctx)
++        {
++            CGPathRef box = CGPathCreateWithRoundedRect(CGRectMake(0, 0, width, height), 8 * scale, 8 * scale, NULL);
++            CGContextSetRGBFillColor(ctx, 0, 0, 0, 0.55);
++            CGContextAddPath(ctx, box);
++            CGContextFillPath(ctx);
++            CGPathRelease(box);
++            CGContextSetRGBFillColor(ctx, 1, 1, 1, 1);
++            for (i = 0; i < [lines count]; i++)
++            {
++                CGContextSetTextPosition(ctx, pad_x, height - pad_y - ascent - line_height * i);
++                CTLineDraw((CTLineRef)[lines objectAtIndex:i], ctx);
++            }
++            CGContextRelease(ctx);
++        }
++        else
++        {
++            free(pixels);
++            pixels = NULL;
++            width = height = 0;
++        }
++        CGColorSpaceRelease(srgb);
++        CFRelease(font);
++    }
++    [rows release];
++    [status release];
++
++    os_unfair_lock_lock(&parkour_frame_lock);
++    free(parkour_frame_pixels);
++    parkour_frame_pixels = pixels;
++    parkour_frame_width = width;
++    parkour_frame_height = height;
++    parkour_frame_rendered_scale = scale;
++    parkour_frame_version++;
++    os_unfair_lock_unlock(&parkour_frame_lock);
++}
++
++/* main thread: the panel's job when DXMT draws the overlay */
++static void parkour_frame_update(NSString *rows, NSString *status)
++{
++    os_unfair_lock_lock(&parkour_frame_lock);
++    [parkour_frame_rows release];
++    parkour_frame_rows = [rows copy];
++    [parkour_frame_status release];
++    parkour_frame_status = [status copy];
++    parkour_frame_running = parkour_running;
++    parkour_frame_start = parkour_start;
++    os_unfair_lock_unlock(&parkour_frame_lock);
++
++    dispatch_async(parkour_draw_queue, ^{ parkour_frame_render(); });
++    if (parkour_running && !parkour_frame_tick)
++    {
++        parkour_frame_tick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, parkour_draw_queue);
++        dispatch_source_set_timer(parkour_frame_tick, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
++                                  100 * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
++        dispatch_source_set_event_handler(parkour_frame_tick, ^{ parkour_frame_render(); });
++        dispatch_resume(parkour_frame_tick);
++    }
++    else if (!parkour_running && parkour_frame_tick)
++    {
++        dispatch_source_cancel(parkour_frame_tick);
++        dispatch_release(parkour_frame_tick);
++        parkour_frame_tick = NULL;
++    }
++}
++
++/* DXMT's present (any thread): returns 1 with the lock held (macdrv_parkour_overlay_unlock), the bitmap and its
++ * version; scale = the drawable's pixels per point */
++__attribute__((visibility("default")))
++int macdrv_parkour_overlay_lock(double scale, uint64_t *version, const void **pixels, uint32_t *width,
++                                uint32_t *height, uint32_t *stride)
++{
++    if (!parkour_enabled()) return 0;
++    os_unfair_lock_lock(&parkour_frame_lock);
++    if (!parkour_frame_seen)
++    {
++        parkour_frame_seen = YES;
++        dispatch_async(dispatch_get_main_queue(), ^{ parkour_redraw(); });   /* hand over from the panel */
++    }
++    if (scale > 0 && fabs(scale - parkour_frame_scale) > 0.01)
++    {
++        parkour_frame_scale = scale;
++        dispatch_async(parkour_draw_queue, ^{ parkour_frame_render(); });
++    }
++    *version = parkour_frame_version;
++    *pixels = parkour_frame_pixels;
++    *width = parkour_frame_width;
++    *height = parkour_frame_height;
++    *stride = parkour_frame_width * 4;
++    return 1;
++}
++
++__attribute__((visibility("default")))
++void macdrv_parkour_overlay_unlock(void)
++{
++    os_unfair_lock_unlock(&parkour_frame_lock);
++}
++
++static BOOL parkour_frame_active(void)
++{
++    BOOL seen;
++
++    os_unfair_lock_lock(&parkour_frame_lock);
++    seen = parkour_frame_seen;
++    os_unfair_lock_unlock(&parkour_frame_lock);
++    return seen;
++}
++
++/* main thread, only when the rows, the status, running or the screen change */
++static void parkour_redraw(void)
++{
++    NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
++    NSMutableString *rows = [NSMutableString string];
++    BOOL status = parkour_status && now < parkour_status_until;
++    NSWindow *game = [NSApp keyWindow] ? [NSApp keyWindow] : [NSApp mainWindow];
++    NSScreen *screen = [game screen] ? [game screen] : [NSScreen mainScreen];
++    CGFloat scale = [screen backingScaleFactor];
++    NSSize rows_size = NSZeroSize, clock_size = NSZeroSize, status_size = NSZeroSize, size;
++    NSRect area = [screen frame], frame;
++    NSUInteger i;
++
++    for (i = 0; i < [parkour_rows count]; i++)
++        [rows appendFormat:@"%@%2lu   %@", i ? @"\n" : @"", (unsigned long)i + 1, [parkour_rows objectAtIndex:i]];
++
++    if (!parkour_running && parkour_tick)
++    {
++        dispatch_source_cancel(parkour_tick);
++        dispatch_release(parkour_tick);
++        parkour_tick = NULL;
++    }
++    if (status)
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((parkour_status_until - now + 0.05) * NSEC_PER_SEC)),
++                       dispatch_get_main_queue(), ^{ parkour_redraw(); });
++    if (parkour_frame_active())
++    {
++        [parkour_panel orderOut:nil];
++        parkour_frame_update(rows, status ? parkour_status : nil);
++        return;
++    }
++
++    if (![rows length] && !parkour_running && !status)
++    {
++        [parkour_panel orderOut:nil];
++        return;
++    }
++    if (!parkour_panel)
++    {
++        NSView *content;
++        CALayer *root = [CALayer layer];
++
++        parkour_panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 10, 10)
++                                                   styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
++                                                     backing:NSBackingStoreBuffered
++                                                       defer:YES];
++        [parkour_panel setOpaque:NO];
++        [parkour_panel setBackgroundColor:[NSColor clearColor]];
++        [parkour_panel setHasShadow:NO];
++        [parkour_panel setIgnoresMouseEvents:YES];
++        [parkour_panel setReleasedWhenClosed:NO];
++        [parkour_panel setHidesOnDeactivate:YES];
++        [parkour_panel setCollectionBehavior:NSWindowCollectionBehaviorCanJoinAllSpaces |
++                                             NSWindowCollectionBehaviorFullScreenAuxiliary |
++                                             NSWindowCollectionBehaviorStationary |
++                                             NSWindowCollectionBehaviorIgnoresCycle];
++        root.backgroundColor = [[NSColor colorWithCalibratedWhite:0 alpha:0.55] CGColor];
++        root.cornerRadius = 8;
++        root.geometryFlipped = YES;
++        content = [parkour_panel contentView];
++        [content setLayer:root];        /* layer-hosting: plain layers, no AppKit view drawing */
++        [content setWantsLayer:YES];
++        parkour_rows_layer = parkour_text_layer(root, scale);
++        parkour_clock = parkour_text_layer(root, scale);
++        parkour_status_layer = parkour_text_layer(root, scale);
++    }
++
++    if ([rows length]) rows_size = [parkour_string(rows) size];
++    /* room for minutes, so the panel doesn't grow while the clock runs */
++    if (parkour_running) clock_size = [parkour_string(parkour_clock_text(MAX(now - parkour_start, 600))) size];
++    if (status) status_size = [parkour_string(parkour_status) size];
++    size = NSMakeSize(ceil(MAX(rows_size.width, MAX(clock_size.width, status_size.width))),
++                      ceil(rows_size.height + clock_size.height + status_size.height));
++
++    [CATransaction begin];
++    [CATransaction setDisableActions:YES];
++    parkour_rows_layer.string = [rows length] ? parkour_string(rows) : nil;
++    parkour_rows_layer.frame = CGRectMake(12, 8, size.width, rows_size.height);
++    parkour_clock.hidden = !parkour_running;
++    parkour_clock.frame = CGRectMake(12, 8 + rows_size.height, size.width, clock_size.height);
++    parkour_status_layer.string = status ? parkour_string(parkour_status) : nil;
++    parkour_status_layer.frame = CGRectMake(12, 8 + rows_size.height + clock_size.height, size.width, status_size.height);
++    parkour_rows_layer.contentsScale = parkour_clock.contentsScale = parkour_status_layer.contentsScale = scale;
++    [CATransaction commit];
++
++    if (parkour_running && !parkour_tick)
++    {
++        parkour_set_clock(now - parkour_start);
++        parkour_tick = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, parkour_draw_queue);
++        dispatch_source_set_timer(parkour_tick, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
++                                  100 * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
++        dispatch_source_set_event_handler(parkour_tick, ^{
++            parkour_set_clock([[NSProcessInfo processInfo] systemUptime] - parkour_start);
++        });
++        dispatch_resume(parkour_tick);
++    }
++    else if (parkour_running)
++        parkour_set_clock(now - parkour_start);   /* E restarted it */
++
++    frame = NSMakeRect(NSMaxX(area) - size.width - 24 - 24, NSMaxY(area) - area.size.height * 0.3 - size.height - 16,
++                       size.width + 24, size.height + 16);
++    if (!NSEqualRects(frame, [parkour_panel frame])) [parkour_panel setFrame:frame display:NO];
++    if ([parkour_panel level] < MAX(NSScreenSaverWindowLevel, [game level] + 1))
++        [parkour_panel setLevel:MAX(NSScreenSaverWindowLevel, [game level] + 1)];
++    if (![parkour_panel isVisible]) [parkour_panel orderFrontRegardless];
++}
++
++/* the key's press and release are kept from the game (YES) while parkour is on and the game is in mouse-look */
++int macdrv_parkour_key(unsigned short keycode, int pressed, int repeat, double timestamp)
++{
++    if (keycode >= sizeof(parkour_swallowed) || !parkour_enabled()) return NO;
++    if (keycode != PARKOUR_KEY_Q && keycode != PARKOUR_KEY_E && keycode != PARKOUR_KEY_T && keycode != PARKOUR_KEY_H)
++        return NO;
++    if (keycode == PARKOUR_KEY_E && (!pressed || repeat)) return NO;
++    if (!pressed || repeat)
++    {
++        BOOL swallowed = parkour_swallowed[keycode];
++        if (!pressed) parkour_swallowed[keycode] = 0;
++        return swallowed;
++    }
++    if (!parkour_mouselook()) return NO;
++    parkour_swallowed[keycode] = keycode != PARKOUR_KEY_E;
++
++    switch (keycode)
++    {
++    case PARKOUR_KEY_Q:
++        parkour_ask_position();
++        break;
++    case PARKOUR_KEY_E:
++        if (!parkour_checkpoint) return NO;   /* just Interact */
++        if (!parkour_exec([NSString stringWithFormat:@"%@;noclip 0%s%s", parkour_checkpoint, *parkour_refresh ? ";" : "",
++                                                      parkour_refresh]))
++            parkour_show_status(@"can't run game commands");
++        else if (*parkour_refresh && *parkour_refresh_off)
++        {
++            parkour_off_pending = YES;
++            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(parkour_refresh_ms * NSEC_PER_MSEC)),
++                           dispatch_get_main_queue(), ^{
++                if (parkour_off_pending) parkour_exec(@"");   /* failed: the next command carries it */
++            });
++        }
++        parkour_running = YES;
++        parkour_start = timestamp;
++        parkour_redraw();
++        return NO;   /* Interact too */
++    case PARKOUR_KEY_T:
++        if (parkour_running)
++        {
++            [parkour_rows addObject:parkour_format(timestamp - parkour_start)];
++            if ([parkour_rows count] > 20) [parkour_rows removeObjectAtIndex:0];
++            macdrv_wheel_log("parkour: time %s\n", [[parkour_rows lastObject] UTF8String]);
++            parkour_running = NO;
++        }
++        else
++        {
++            parkour_running = YES;
++            parkour_start = timestamp;
++        }
++        parkour_redraw();
++        break;
++    case PARKOUR_KEY_H:
++        if (![parkour_rows count] && !parkour_running && parkour_checkpoint)
++        {
++            [parkour_checkpoint release];
++            parkour_checkpoint = nil;
++            parkour_show_status(@"checkpoint cleared");
++            break;
++        }
++        [parkour_rows removeAllObjects];
++        parkour_running = NO;
++        [parkour_status release];
++        parkour_status = nil;
++        parkour_redraw();
++        break;
++    }
++    return YES;
++}
++
+ @implementation WineApplicationController
+ 
++    static BOOL parkour_mouselook(void)
++    {
++        WineApplicationController *controller = [WineApplicationController sharedController];
++        return controller->clientWantsCursorHidden && controller.clippingCursor;
++    }
++
+     @synthesize keyboardType, lastFlagsChanged;
+     @synthesize applicationIcon;
+     @synthesize cursorFrames, cursorTimer, cursor;
+@@ -1406,6 +2218,9 @@
+         WineWindow* targetWindow;
+         BOOL drag = [anEvent type] != NSEventTypeMouseMoved;
+ 
++        if (!parkour_map_state && clientWantsCursorHidden && self.clippingCursor)
++            parkour_map_reload_kick();   /* deadlock-gptk: --map's second load */
++
+         if ([windowsBeingDragged count])
+             targetWindow = nil;
+         else if (mouseCaptureWindow)
+@@ -1737,6 +2552,7 @@
+                 event->mouse_scroll.x = floor(pt.x);
+                 event->mouse_scroll.y = floor(pt.y);
+                 event->mouse_scroll.time_ms = [self ticksForEventTime:[theEvent timestamp]];
++                event->mouse_scroll.look = clientWantsCursorHidden && self.clippingCursor;
+ 
+                 if (CGEventGetIntegerValueField(cgevent, kCGScrollWheelEventIsContinuous))
+                 {
+@@ -1838,6 +2654,77 @@
+                     accumScrollY -= event->mouse_scroll.y_scroll;
+                 }
+ 
++                if (wheel_gate_ms() > 0 && clientWantsCursorHidden && self.clippingCursor && event->mouse_scroll.y_scroll)
++                {
++                    int dir = event->mouse_scroll.y_scroll > 0 ? 1 : -1;
++                    double gap = ([theEvent timestamp] - wheel_gate_last) * 1000;
++                    BOOL repeat = dir == wheel_gate_dir && gap < wheel_gate_ms();
++                    const char *what = repeat ? "dropped" : "kept";
++                    wheel_gate_last = [theEvent timestamp];
++                    wheel_gate_dir = dir;
++                    event->mouse_scroll.y_scroll = repeat ? 0 : 120 * dir;
++                    wheel_repress_init();
++                    BOOL raw = [theEvent timestamp] < wheel_raw_until && (!wheel_repress_dir || dir == wheel_repress_dir);
++                    if (raw)
++                    {
++                        repeat = NO;
++                        event->mouse_scroll.y_scroll = 120 * dir;
++                        what = "kept (raw after key pressed twice)";
++                    }
++                    if (!repeat && wheel_pending)
++                    {
++                        event->mouse_scroll.y_scroll = 0;
++                        what = "dropped (a delayed wheel jump is queued)";
++                    }
++                    else if (!repeat && wheel_repress_key >= 0 && (!wheel_repress_dir || dir == wheel_repress_dir))
++                    {
++                        CGKeyCode key = wheel_repress_key;
++                        BOOL held = wheel_keys_down[key];
++                        double since = ([[NSProcessInfo processInfo] systemUptime] - wheel_keys_press_time[key]) * 1000;
++                        double wait = wheel_after_key_ms() > 0 && !raw ? wheel_after_key_ms() - since : 0;
++
++                        if (wait < 0) wait = 0;
++                        if (held && wait < wheel_repress_ms) wait = wheel_repress_ms;
++                        if (held || wait > 0)
++                        {
++                            CGEventFlags modifiers = CGEventGetFlags(cgevent);
++                            WineWindow *target = [window retain];
++                            int x = event->mouse_scroll.x, y = event->mouse_scroll.y, y_scroll = 120 * dir;
++                            static char buf[96];
++
++                            if (held) wheel_post_key(target, key, FALSE, modifiers);
++                            wheel_pending = TRUE;
++                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_MSEC)),
++                                           dispatch_get_main_queue(), ^{
++                                double at = ([[NSProcessInfo processInfo] systemUptime] - wheel_keys_press_time[key]) * 1000;
++                                wheel_pending = FALSE;
++                                if (held)
++                                {
++                                    BOOL still_down = wheel_keys_down[key];
++                                    wheel_post_key(target, key, TRUE, modifiers);
++                                    if (!still_down) wheel_post_key(target, key, FALSE, modifiers);
++                                    macdrv_wheel_log("key %d re-pressed %.0f ms after its press%s\n", key, at,
++                                                     still_down ? "" : " + released (let go meanwhile)");
++                                }
++                                else
++                                {
++                                    wheel_post_scroll(target, x, y, y_scroll);
++                                    macdrv_wheel_log("wheel notch sent %.0f ms after key %d's press\n", at, key);
++                                }
++                                [target release];
++                            });
++                            event->mouse_scroll.y_scroll = 0;
++                            snprintf(buf, sizeof(buf), "%.0f ms after key press: %s in %.0f ms", since,
++                                     held ? "key held -> released, re-press" : "notch delayed", wait);
++                            what = buf;
++                        }
++                    }
++                    macdrv_wheel_log("%lu wheel-in dir=%d gap=%.1fms %s\n", event->mouse_scroll.time_ms, dir, gap, what);
++                }
++                else if (event->mouse_scroll.y_scroll)
++                    macdrv_wheel_log("%lu wheel-in y=%d look=%d (hidden=%d clip=%d) not gated\n", event->mouse_scroll.time_ms,
++                                     event->mouse_scroll.y_scroll, event->mouse_scroll.look, clientWantsCursorHidden, self.clippingCursor);
++
+                 if (event->mouse_scroll.x_scroll || event->mouse_scroll.y_scroll)
+                     [window.queue postEvent:event];
+ 
+@@ -2316,6 +3203,7 @@
+ 
+     - (void)applicationDidResignActive:(NSNotification *)notification
+     {
++        memset(wheel_keys_down, 0, sizeof(wheel_keys_down));   /* deadlock-gptk: releases are lost while inactive */
+         macdrv_event* event;
+         WineEventQueue* queue;
+ 
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/winemac.drv/cocoa_window.m b-wine/dlls/winemac.drv/cocoa_window.m
+--- a/dlls/winemac.drv/cocoa_window.m
++++ b/dlls/winemac.drv/cocoa_window.m
+@@ -2119,10 +2119,16 @@
+         CGEventRef cgevent;
+         WineApplicationController* controller = [WineApplicationController sharedController];
+ 
++        if (macdrv_parkour_key(keyCode, pressed, pressed && [theEvent type] == NSEventTypeKeyDown && [theEvent isARepeat],
++                               [theEvent timestamp]))
++            return;   /* deadlock-gptk: --parkour key (cocoa_app.m) */
++
+         event = macdrv_create_event(pressed ? KEY_PRESS : KEY_RELEASE, self);
+         event->key.keycode   = keyCode;
+         event->key.modifiers = modifiers;
+         event->key.time_ms   = [controller ticksForEventTime:[theEvent timestamp]];
++        event->key.repeat    = pressed && [theEvent type] == NSEventTypeKeyDown && [theEvent isARepeat];
++        macdrv_wheel_note_key(keyCode, pressed, event->key.repeat, [theEvent timestamp]);
+ 
+         if ((cgevent = [theEvent CGEvent]))
+             controller.keyboardType = CGEventGetIntegerValueField(cgevent, kCGKeyboardEventKeyboardType);
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/winemac.drv/keyboard.c b-wine/dlls/winemac.drv/keyboard.c
+--- a/dlls/winemac.drv/keyboard.c
++++ b/dlls/winemac.drv/keyboard.c
+@@ -939,6 +939,54 @@
+ }
+ 
+ 
++/* deadlock-gptk: WINE_MAC_WHEEL_RELEASE=<vkey>[:up|:down] (e.g. 0x20:up) - in mouse-look, a wheel notch (in that
++ * direction) while <vkey> is held first sends <vkey>'s release. A game with the wheel and that key on one action
++ * (Deadlock: Jump on SPACE + MWHEELUP) then sees the notch as a new press, so Space -> wheel at any speed is jump + air
++ * jump; otherwise the action is still down from Space and the notch does nothing. Until the key really comes up, its
++ * auto-repeats are dropped (they would press it again). */
++static WORD wheel_release_vkey;
++static int wheel_release_dir, wheel_release_init;
++static BOOL wheel_released;     /* release sent, key still physically down */
++
++void macdrv_wheel_release(HWND hwnd, int y_scroll, unsigned long time_ms)
++{
++    struct macdrv_thread_data *thread_data = macdrv_thread_data();
++    unsigned int i;
++
++    if (!wheel_release_init)
++    {
++        const char *s = getenv("WINE_MAC_WHEEL_RELEASE");
++        char *end;
++        wheel_release_init = 1;
++        if (s && *s)
++        {
++            wheel_release_vkey = strtoul(s, &end, 0);
++            if (!strcmp(end, ":up")) wheel_release_dir = 1;
++            else if (!strcmp(end, ":down")) wheel_release_dir = -1;
++        }
++    }
++    if (!wheel_release_vkey || !thread_data) return;
++    if (wheel_release_dir && (y_scroll > 0 ? 1 : -1) != wheel_release_dir) return;
++    if (!(NtUserGetAsyncKeyState(wheel_release_vkey) & 0x8000))
++    {
++        macdrv_wheel_log("%lu wheel-out y=%d key 0x%x up: nothing to release\n", time_ms, y_scroll, wheel_release_vkey);
++        return;
++    }
++    for (i = 0; i < ARRAY_SIZE(thread_data->keyc2vkey); i++)
++    {
++        if (thread_data->keyc2vkey[i] != wheel_release_vkey) continue;
++        TRACE_(key)("wheel: releasing vkey 0x%x\n", wheel_release_vkey);
++        macdrv_send_keyboard_input(hwnd, wheel_release_vkey, thread_data->keyc2scan[i] & 0xff,
++                                   KEYEVENTF_KEYUP | ((thread_data->keyc2scan[i] & 0x100) ? KEYEVENTF_EXTENDEDKEY : 0),
++                                   time_ms);
++        wheel_released = TRUE;
++        macdrv_wheel_log("%lu wheel-out y=%d key 0x%x was down: release sent (hwnd %p)\n", time_ms, y_scroll,
++                         wheel_release_vkey, hwnd);
++        return;
++    }
++}
++
++
+ /***********************************************************************
+  *           update_modifier_state
+  */
+@@ -1010,6 +1058,16 @@
+                 event->key.keycode, vkey, scan);
+ 
+     if (!vkey) return;
++
++    if (vkey && vkey == (wheel_release_vkey ? wheel_release_vkey : VK_SPACE))
++        macdrv_wheel_log("%lu key 0x%x %s%s%s\n", event->key.time_ms, vkey, event->type == KEY_PRESS ? "down" : "up",
++                         event->key.repeat ? " repeat" : "",
++                         wheel_released && event->type == KEY_PRESS && event->key.repeat ? " dropped" : "");
++    if (wheel_released && vkey == wheel_release_vkey)
++    {
++        if (event->type == KEY_PRESS && event->key.repeat) return;
++        wheel_released = FALSE;
++    }
+ 
+     flags = 0;
+     if (event->type == KEY_RELEASE) flags |= KEYEVENTF_KEYUP;
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/winemac.drv/macdrv.h b-wine/dlls/winemac.drv/macdrv.h
+--- a/dlls/winemac.drv/macdrv.h
++++ b/dlls/winemac.drv/macdrv.h
+@@ -232,6 +232,7 @@
+     HWND                hwnd;                   /* hwnd that this private data belongs to */
+     WineWindow         *cocoa_window;
+     WineContentView    *client_view;
++    WineContentView    *dxmt_client_view; /* deadlock-gptk: view hosting DXMT's Metal view */
+     struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
+     int                 pixel_format;           /* pixel format for GL */
+     HANDLE              drag_event;             /* event to signal that Cocoa-driven window dragging has ended */
+@@ -291,6 +292,7 @@
+ 
+ extern void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data);
+ extern void macdrv_keyboard_changed(const macdrv_event *event);
++extern void macdrv_wheel_release(HWND hwnd, int y_scroll, unsigned long time_ms);
+ extern void macdrv_key_event(HWND hwnd, const macdrv_event *event);
+ extern void macdrv_hotkey_press(const macdrv_event *event);
+ extern HKL macdrv_get_hkl_from_source(TISInputSourceRef input_source);
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/winemac.drv/macdrv_cocoa.h b-wine/dlls/winemac.drv/macdrv_cocoa.h
+--- a/dlls/winemac.drv/macdrv_cocoa.h
++++ b/dlls/winemac.drv/macdrv_cocoa.h
+@@ -217,6 +217,9 @@
+ extern void macdrv_quit_reply(int reply);
+ extern bool macdrv_using_input_method(void);
+ extern void macdrv_set_mouse_capture_window(WineWindow *window);
++extern void macdrv_wheel_note_key(unsigned short keycode, int pressed, int repeat, double timestamp);
++extern void macdrv_wheel_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++extern int macdrv_parkour_key(unsigned short keycode, int pressed, int repeat, double timestamp);
+ extern void macdrv_set_cocoa_retina_mode(bool new_mode);
+ 
+ 
+@@ -343,6 +346,7 @@
+             CGKeyCode                   keycode;
+             CGEventFlags                modifiers;
+             unsigned long               time_ms;
++            int                         repeat;     /* deadlock-gptk: key auto-repeat */
+         }                                           key;
+         struct {
+             CFDataRef                   uchr;
+@@ -369,6 +373,7 @@
+             int             x;
+             int             y;
+             unsigned long   time_ms;
++            int             look;       /* deadlock-gptk: client hides + clips the cursor (mouse-look) */
+         }                                           mouse_scroll;
+         struct {
+             struct macdrv_query *query;
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/winemac.drv/mouse.c b-wine/dlls/winemac.drv/mouse.c
+--- a/dlls/winemac.drv/mouse.c
++++ b/dlls/winemac.drv/mouse.c
+@@ -924,6 +924,12 @@
+           event->mouse_scroll.x, event->mouse_scroll.y,
+           event->mouse_scroll.time_ms, (NtGetTickCount() - event->mouse_scroll.time_ms));
+ 
++    if (event->mouse_scroll.y_scroll && event->mouse_scroll.look)
++        macdrv_wheel_release(hwnd, event->mouse_scroll.y_scroll, event->mouse_scroll.time_ms);
++    if (event->mouse_scroll.y_scroll)
++        macdrv_wheel_log("%lu wheel-out y=%d look=%d sent to game (%lu ms after the Mac event)\n", event->mouse_scroll.time_ms,
++                         event->mouse_scroll.y_scroll, event->mouse_scroll.look,
++                         (unsigned long)(NtGetTickCount() - event->mouse_scroll.time_ms));
+     if (event->mouse_scroll.y_scroll)
+         send_mouse_input(hwnd, event->window, MOUSEEVENTF_WHEEL | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+                          event->mouse_scroll.x, event->mouse_scroll.y,
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/winemac.drv/surface.c b-wine/dlls/winemac.drv/surface.c
+--- a/dlls/winemac.drv/surface.c
++++ b/dlls/winemac.drv/surface.c
+@@ -124,7 +124,9 @@
+      * content in the window_surface */
+     if ((data = get_win_data(window_surface->hwnd)))
+     {
+-        if (data->client_view)
++        /* deadlock-gptk: not DXMT's view: DXMT presents through Metal directly, never through
++         * client_surface_present, so nothing would show the view again (black window). */
++        if (data->client_view && data->client_view != data->dxmt_client_view)
+         {
+             macdrv_set_view_hidden(data->client_view, TRUE);
+             data->client_view = NULL;
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/dlls/winemac.drv/window.c b-wine/dlls/winemac.drv/window.c
+--- a/dlls/winemac.drv/window.c
++++ b/dlls/winemac.drv/window.c
+@@ -1084,8 +1084,19 @@
+ 
+         if ((data = get_win_data(client->hwnd)))
+         {
++            if (data->dxmt_client_view == surface->cocoa_view)
++                data->dxmt_client_view = NULL;
+             if (data->client_view == surface->cocoa_view)
++            {
+                 data->client_view = NULL;
++                /* deadlock-gptk: another client surface (e.g. a Vulkan probe) hid DXMT's view when it
++                 * presented; once that surface goes away, show DXMT's view again. */
++                if (data->dxmt_client_view)
++                {
++                    data->client_view = data->dxmt_client_view;
++                    macdrv_set_view_hidden(data->client_view, FALSE);
++                }
++            }
+             release_win_data(data);
+         }
+ 
+@@ -1115,6 +1126,14 @@
+     TRACE("%s\n", debugstr_client_surface(client));
+ 
+     if (!(data = get_win_data(surface->client.hwnd))) return;
++    /* deadlock-gptk: DXMT presents through Metal, not here; a GL/Vulkan surface created on the same
++     * window (Source 2 probes Vulkan) must not hide DXMT's view just by being created. */
++    if (data->dxmt_client_view && data->client_view == data->dxmt_client_view &&
++        surface->cocoa_view != data->dxmt_client_view)
++    {
++        release_win_data(data);
++        return;
++    }
+     if (data->client_view != surface->cocoa_view)
+     {
+         if (data->client_view) macdrv_set_view_hidden(data->client_view, TRUE);
+@@ -2228,6 +2247,15 @@
+     struct neutron_dxmt_win_data *ret;
+ 
+     if (!data) return NULL;
++    /* deadlock-gptk: DXMT gets a client view of its own; the window's current client view may
++     * belong to another surface (Source 2's Vulkan probe) that hides and disposes it later. */
++    if (!data->dxmt_client_view || data->client_view != data->dxmt_client_view)
++    {
++        release_win_data( data );
++        macdrv_CreateClientSurface( hwnd, 0, FALSE );
++        if (!(data = get_win_data( hwnd ))) return NULL;
++        data->dxmt_client_view = data->client_view;
++    }
+     if (!data->client_view)
+     {
+         /* Wine 11 creates the client view only for a client surface (GL/Vulkan do that);
+@@ -2241,6 +2269,8 @@
+         release_win_data( data );
+         return NULL;
+     }
++    data->dxmt_client_view = data->client_view;
++    macdrv_set_view_hidden(data->client_view, FALSE);
+     ret->hwnd = data->hwnd;
+     ret->cocoa_window = data->cocoa_window;
+     ret->cocoa_view = data->client_view;
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/include/ddk/d3dkmthk.h b-wine/include/ddk/d3dkmthk.h
+--- a/include/ddk/d3dkmthk.h
++++ b/include/ddk/d3dkmthk.h
+@@ -149,6 +149,54 @@
+     D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId;
+ } D3DKMT_CHECKVIDPNEXCLUSIVEOWNERSHIP;
+ 
++/* deadlock-gptk: as in CrossOver's winecx headers (win32u d3dkmt adapter queries) */
++typedef struct _D3DKMT_ADAPTERADDRESS
++{
++    UINT BusNumber;
++    UINT DeviceNumber;
++    UINT FunctionNumber;
++} D3DKMT_ADAPTERADDRESS;
++
++typedef struct _D3DKMT_SEGMENTSIZEINFO
++{
++    UINT64 DedicatedVideoMemorySize;
++    UINT64 DedicatedSystemMemorySize;
++    UINT64 SharedSystemMemorySize;
++} D3DKMT_SEGMENTSIZEINFO;
++
++typedef struct _D3DKMT_PHYSICAL_ADAPTER_COUNT
++{
++    UINT Count;
++} D3DKMT_PHYSICAL_ADAPTER_COUNT;
++
++typedef struct _D3DKMT_ADAPTERTYPE
++{
++    union
++    {
++        struct
++        {
++            UINT RenderSupported : 1;
++            UINT DisplaySupported : 1;
++            UINT SoftwareDevice : 1;
++            UINT PostDevice : 1;
++            UINT HybridDiscrete : 1;
++            UINT HybridIntegrated : 1;
++            UINT IndirectDisplayDevice : 1;
++            UINT Paravirtualized : 1;
++            UINT ACGSupported : 1;
++            UINT SupportSetTimingsFromVidPn : 1;
++            UINT Detachable : 1;
++            UINT ComputeOnly : 1;
++            UINT Prototype : 1;
++            UINT RuntimePowerManagement : 1;
++            UINT TestOnly : 1;
++            UINT SingleAdapterHybridMode : 1;
++            UINT Reserved : 16;
++        } DUMMYSTRUCTNAME;
++        UINT Value;
++    } DUMMYUNIONNAME;
++} D3DKMT_ADAPTERTYPE;
++
+ #define D3DKMT_QUERYSTATISTICS_SEGMENT_PREFERENCE_MAX 5
+ 
+ typedef struct _D3DKMT_CLOSEADAPTER
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/include/wine/msync.h b-wine/include/wine/msync.h
+--- a/include/wine/msync.h
++++ b/include/wine/msync.h
+@@ -4,7 +4,7 @@
+  * The same object model and wait algorithm as the Linux ntsync driver
+  * (drivers/misc/ntsync.c), done in user space: the wineserver creates a shared
+  * memory region and sends its fd to every client process as the "inproc device".
+- * Objects (semaphores, mutexes, events) are 64-byte slots in it, identified by
++ * Objects (semaphores, mutexes, events) are 128-byte slots in it, identified by
+  * their index, which replaces the ntsync object fd. Every thread has a wait block
+  * (struct msync_q) in the region; a wait links one entry per object into the
+  * object's waiter list, and whoever changes an object's state satisfies waiters
+@@ -32,17 +32,18 @@
+ #include <os/clock.h>
+ 
+ #define MSYNC_MAGIC      0x6e73796d   /* "msyn" */
+-#define MSYNC_VERSION    1
+-#define MSYNC_MAX_OBJS   (1u << 19)   /* 512K objects of 64 bytes: 32 MB */
++#define MSYNC_VERSION    2            /* 2: 128-byte object slots */
++#define MSYNC_MAX_OBJS   (1u << 19)   /* 512K objects of 128 bytes: 64 MB */
+ #define MSYNC_MAX_QS     (1u << 15)   /* 32K wait blocks of 1 KB: 32 MB */
+ #define MSYNC_MAX_WAIT   65           /* 64 objects plus the alert event */
+-#define MSYNC_SIZE       ((size_t)MSYNC_MAX_OBJS * 64 + (size_t)MSYNC_MAX_QS * 1024)
++#define MSYNC_OBJ_SIZE   128          /* one Apple Silicon cache line per object: no false sharing between objects */
++#define MSYNC_SIZE       ((size_t)MSYNC_MAX_OBJS * MSYNC_OBJ_SIZE + (size_t)MSYNC_MAX_QS * 1024)
+ #define MSYNC_NONE       0xffffffffu  /* q->signaled while waiting */
+ #define MSYNC_DEAD_PID   0xffffffffu  /* q->pid after the owner process died */
+ 
+ enum msync_type { MSYNC_FREE = 0, MSYNC_SEM = 1, MSYNC_MUTEX = 2, MSYNC_EVENT = 3 };
+ 
+-struct msync_obj   /* 64 bytes, slot 0 is the header */
++struct msync_obj   /* MSYNC_OBJ_SIZE bytes, slot 0 is the header */
+ {
+     uint32_t lock;
+     uint32_t type;
+@@ -54,7 +55,7 @@
+     uint32_t count;      /* sem: count, mutex: recursion count, event: signaled */
+     uint32_t max;        /* sem: maximum, mutex: owner tid, event: manual reset */
+     uint32_t ownerdead;  /* mutex: abandoned */
+-    uint32_t pad[6];
++    uint32_t pad[MSYNC_OBJ_SIZE / 4 - 10];
+ };
+ 
+ struct msync_header   /* overlays object slot 0 */
+@@ -67,7 +68,7 @@
+     uint32_t obj_free;
+     uint32_t q_bump;
+     uint32_t q_free;
+-    uint32_t pad[8];
++    uint32_t pad[MSYNC_OBJ_SIZE / 4 - 8];
+ };
+ 
+ struct msync_entry { uint32_t obj, next, prev; };
+@@ -97,7 +98,7 @@
+ static inline struct msync_obj *msync_obj( void *shm, uint32_t idx ) { return (struct msync_obj *)shm + idx; }
+ static inline struct msync_q *msync_q( void *shm, uint32_t qi )
+ {
+-    return (struct msync_q *)((char *)shm + (size_t)MSYNC_MAX_OBJS * 64) + qi;
++    return (struct msync_q *)((char *)shm + (size_t)MSYNC_MAX_OBJS * MSYNC_OBJ_SIZE) + qi;
+ }
+ static inline struct msync_entry *msync_entry( void *shm, uint32_t ref )
+ {
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/server/main.c b-wine/server/main.c
+--- a/server/main.c
++++ b/server/main.c
+@@ -43,6 +43,10 @@
+ #include "object.h"
+ #include "file.h"
+ #include "thread.h"
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <mach/thread_policy.h>
++#endif
+ #include "request.h"
+ #include "unicode.h"
+ 
+@@ -274,6 +278,23 @@
+ #ifdef __APPLE__
+     /* neutron: the server thread is on the critical path of every wait and event, run it at the top QoS class */
+     pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 );
++    /* deadlock-gptk (winecx patch 0023): WINE_SERVER_QOS=N (1 = 16) also raises the request loop's Mach
++     * precedence by N - QoS classes don't apply to a process's main thread on macOS (10-18 probe), precedence
++     * does. Client threads block on every server call; at default precedence the server queues behind the
++     * game's busy threads on saturated performance cores. */
++    {
++        const char *env = getenv( "WINE_SERVER_QOS" );
++        int boost = env ? atoi( env ) : 0;
++        if (boost > 0)
++        {
++            thread_precedence_policy_data_t precedence = { .importance = boost == 1 ? 16 : boost };
++            integer_t latency = LATENCY_QOS_TIER_0;
++            thread_policy_set( mach_thread_self(), THREAD_LATENCY_QOS_POLICY, (thread_policy_t)&latency,
++                               THREAD_LATENCY_QOS_POLICY_COUNT );
++            thread_policy_set( mach_thread_self(), THREAD_PRECEDENCE_POLICY, (thread_policy_t)&precedence,
++                               THREAD_PRECEDENCE_POLICY_COUNT );
++        }
++    }
+ #endif
+     main_loop();
+     return 0;
+diff --color -ruN -x lsteamclient -x steam_helper -x autom4te.cache -x configure -x configure~ -x config.h.in -x config.h.in~ -x *.orig -x *.rej wine/server/thread.c b-wine/server/thread.c
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -240,6 +240,26 @@
+     return min + (effective_priority - 1) * range / 14;
+ }
+ 
++/* deadlock-gptk (winecx patch 0015): WINE_MAINTHRD_QOS=1 maps the Windows thread named MainThrd to the top
++ * non-realtime Mach QoS tier with the importance of priority 14 (the game's frame rate is bound by it). */
++static int mainthrd_qos(void)
++{
++    static int boost = -1;
++    if (boost < 0)
++    {
++        const char *env = getenv( "WINE_MAINTHRD_QOS" );
++        boost = env && env[0] == '1';
++    }
++    return boost;
++}
++
++static int thread_desc_is_mainthrd( const struct thread *thread )
++{
++    static const WCHAR name[] = {'M','a','i','n','T','h','r','d'};
++    return thread->desc && thread->desc_len == sizeof(name)
++           && !memcmp( thread->desc, name, sizeof(name) );
++}
++
+ static void apply_thread_priority( struct thread *thread )
+ {
+     kern_return_t kr;
+@@ -284,6 +304,13 @@
+         latency_qos = LATENCY_QOS_TIER_UNSPECIFIED;
+         break;
+     }
++    if (mainthrd_qos() && thread_desc_is_mainthrd( thread ) && effective_priority < LOW_REALTIME_PRIORITY)
++    {
++        throughput_qos = THROUGHPUT_QOS_TIER_0;
++        latency_qos = LATENCY_QOS_TIER_0;
++        thread_extended_policy.timeshare = 1;
++        thread_precedence_policy.importance = max( thread_precedence_policy.importance, get_mach_importance( 14 ));
++    }
+     /* QOS_UNSPECIFIED is assigned the highest tier available, so it does not provide a limit */
+     if (effective_priority >= LOW_REALTIME_PRIORITY || effective_priority > thread->priority)
+     {
+@@ -890,6 +917,11 @@
+                 free( thread->desc );
+                 thread->desc = desc;
+                 thread->desc_len = desc_len;
++#ifdef __APPLE__
++                /* deadlock-gptk: the MainThrd QoS depends on the description: re-apply after a rename */
++                if (thread->state == RUNNING && thread->unix_tid != -1)
++                    apply_thread_priority( thread );
++#endif
+             }
+         }
+         else

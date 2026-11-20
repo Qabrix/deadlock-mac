@@ -1,0 +1,50 @@
+--- a/dlls/ntdll/time.c	2026-10-13 01:08:29
++++ b/dlls/ntdll/time.c	2026-10-17 22:08:30
+@@ -379,8 +379,47 @@
+ /******************************************************************************
+  *  RtlQueryPerformanceCounter   [NTDLL.@]
+  */
++#ifdef __x86_64__
++/* deadlock-gptk: under Rosetta, rdtsc counts nanoseconds of mach_continuous_time, the clock behind
++ * NtQueryPerformanceCounter (100 ns units). Source 2 reads the counter ~290k times a second on its
++ * main thread; each syscall costs Rosetta an FPU save/restore and two TSD-base switches. Read it in
++ * user mode instead, after checking once that rdtsc / 100 matches the syscall's clock. */
++static inline ULONGLONG qpc_rdtsc(void)
++{
++    unsigned int lo, hi;
++    __asm__ __volatile__( "rdtsc" : "=a" (lo), "=d" (hi) );
++    return ((ULONGLONG)hi << 32) | lo;
++}
++
++static int qpc_rdtsc_matches(void)
++{
++    LARGE_INTEGER before, after;
++    ULONGLONG t;
++    int i;
++
++    for (i = 0; i < 3; i++)
++    {
++        NtQueryPerformanceCounter( &before, NULL );
++        t = qpc_rdtsc() / 100;
++        NtQueryPerformanceCounter( &after, NULL );
++        if (t + 2 >= (ULONGLONG)before.QuadPart && t <= (ULONGLONG)after.QuadPart + 2) return 1;
++    }
++    return 0;
++}
++#endif
++
+ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
+ {
++#ifdef __x86_64__
++    static int fast = -1;
++
++    if (fast < 0) fast = qpc_rdtsc_matches();
++    if (fast)
++    {
++        counter->QuadPart = qpc_rdtsc() / 100;
++        return TRUE;
++    }
++#endif
+     NtQueryPerformanceCounter( counter, NULL );
+     return TRUE;
+ }

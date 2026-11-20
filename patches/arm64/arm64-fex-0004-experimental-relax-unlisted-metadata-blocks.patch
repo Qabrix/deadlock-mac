@@ -1,0 +1,28 @@
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -595,9 +595,16 @@
+ #endif
+ 
+       bool BlockInForceTSOValidRange = false;
++      [[maybe_unused]] bool BlockRelaxed = false;
+       auto InstForceTSOIt = ForceTSOInstructions.end();
+       if (!UnitHasAtomic && ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
++#ifdef DL_RELAX_UNLISTED
++        // deadlock-gptk (experiment): MSVC volatile metadata covers this block and lists none of its accesses, and the
++        // unit has no atomic: MSVC semantics say no access here needs ordering, so translate it without TSO.
++        BlockRelaxed = true;
++#endif
+         if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); It != ForceTSOInstructions.end() && *It < Block.Entry + Block.Size) {
++          BlockRelaxed = false;
+           InstForceTSOIt = It;
+           BlockInForceTSOValidRange = true;
+         }
+@@ -701,6 +708,8 @@
+             }
+           } else if (DecodedInfo->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) {
+             ForceTSO = IR::ForceTSOMode::ForceEnabled;
++          } else if (BlockRelaxed) {
++            ForceTSO = IR::ForceTSOMode::ForceDisabled;
+           }
+ 
+           Thread->OpDispatcher->SetForceTSO(ForceTSO);

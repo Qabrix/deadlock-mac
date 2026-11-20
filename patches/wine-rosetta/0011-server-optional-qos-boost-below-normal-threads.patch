@@ -1,0 +1,39 @@
+diff --git a/server/thread.c b/server/thread.c
+index 7c16850..b9636fd 100644
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -235,6 +235,17 @@ void init_threading(void)
+     }
+ }
+ 
++static int qos_boost(void)
++{
++    static int boost = -1;
++    if (boost < 0)
++    {
++        const char *env = getenv( "WINE_QOS_BOOST" );
++        boost = env && env[0] == '1';
++    }
++    return boost;
++}
++
+ static int get_mach_importance( int effective_priority )
+ {
+     int min = -31, max = 32, range = max - min;
+@@ -285,6 +296,16 @@ static void apply_thread_priority( struct thread *thread )
+         latency_qos = LATENCY_QOS_TIER_UNSPECIFIED;
+         break;
+     }
++    /* deadlock-gptk: WINE_QOS_BOOST=1 keeps below-normal threads (game job workers) at the
++     * normal tiers and importance. Windows only orders them behind normal threads; the QoS
++     * tiers above make macOS treat them as UTILITY work: efficiency cores, throttled. */
++    if (qos_boost() && throughput_qos > THROUGHPUT_QOS_TIER_1 && thread->base_priority > THREAD_PRIORITY_LOWEST)
++    {
++        throughput_qos = THROUGHPUT_QOS_TIER_1;
++        latency_qos = LATENCY_QOS_TIER_1;
++        thread_precedence_policy.importance = max( thread_precedence_policy.importance,
++                                                   get_mach_importance( effective_priority - thread->base_priority ));
++    }
+     /* QOS_UNSPECIFIED is assigned the highest tier available, so it does not provide a limit */
+     if (effective_priority >= LOW_REALTIME_PRIORITY || effective_priority > thread->priority)
+     {

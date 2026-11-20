@@ -1,0 +1,47 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-10-13 03:46:54
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-10-13 03:46:54
+@@ -27,6 +27,7 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <dlfcn.h>
+ #include <pthread.h>
+ #include <signal.h>
+ #include <stdlib.h>
+@@ -2391,9 +2392,36 @@
+  *
+  * Handler for SIGSEGV and related errors.
+  */
++#ifdef __APPLE__
++/* deadlock-gptk debug aid: WINE_NATIVE_FAULT_REPORT=1 hands faults that happen inside native
++ * Mach-O code (macOS libraries, D3DMetal, ...) to macOS instead of turning them into Windows
++ * exceptions, so ReportCrash writes a .ips with the full native backtrace. Off by default:
++ * some games rely on Wine converting such faults. */
++static BOOL native_fault_report( int sig, void *pc )
++{
++    static int enabled = -1;
++    Dl_info info;
++    if (enabled == -1)
++    {
++        const char *env = getenv( "WINE_NATIVE_FAULT_REPORT" );
++        enabled = env && atoi( env );
++    }
++    if (!enabled || !dladdr( pc, &info ) || !info.dli_fname) return FALSE;
++    {
++        struct sigaction sa = { 0 };
++        sa.sa_handler = SIG_DFL;
++        sigaction( sig, &sa, NULL );   /* the faulting instruction re-runs and kills us */
++    }
++    return TRUE;
++}
++#endif
++
+ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
+ {
+     ucontext_t *sigcontext = _sigcontext;
++#ifdef __APPLE__
++    if (native_fault_report( signal, (void *)RIP_sig(sigcontext) )) return;
++#endif
+     struct thread_data *data = init_handler( sigcontext );
+     struct xcontext context;
+     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)RIP_sig(sigcontext) };

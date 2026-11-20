@@ -1,0 +1,28 @@
+--- a/dlls/win32u/vulkan.c	2026-10-13 01:25:43
++++ b/dlls/win32u/vulkan.c	2026-10-13 01:25:43
+@@ -595,6 +595,7 @@
+ {
+     VkInstanceCreateInfo *create_info = (VkInstanceCreateInfo *)client_create_info; /* cast away const, chain has been copied in the thunks */
+     VkInstance host_instance = VK_NULL_HANDLE, client_instance = *client_instance_ptr;
++    VkApplicationInfo host_app_info = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO};
+     struct vulkan_physical_device *physical_devices;
+     struct mempool pool = {0};
+     struct instance *instance;
+@@ -609,6 +610,17 @@
+     list_init( &instance->report_callbacks );
+ 
+     if ((res = convert_instance_create_info( &pool, create_info, instance ))) goto failed;
++    /* deadlock-gptk: MoltenVK is spec-strict and returns NULL from vkGetInstanceProcAddr for
++     * core 1.1+ entry points on an API 1.0 instance; the Windows loader always returns them.
++     * Callers that create a 1.0 instance and use e.g. vkGetPhysicalDeviceProperties2 unchecked
++     * (Chromium, and the D3DMetal path) jump to NULL. Create the host instance at 1.3 instead. */
++    if (create_info->pApplicationInfo) host_app_info = *create_info->pApplicationInfo;
++    if (host_app_info.apiVersion < VK_API_VERSION_1_1)
++    {
++        host_app_info.apiVersion = VK_API_VERSION_1_3;
++        create_info->pApplicationInfo = &host_app_info;
++    }
++
+     if ((res = p_vkCreateInstance( create_info, NULL /* allocator */, &host_instance ))) goto failed;
+ 
+     vulkan_object_init_ptr( &instance->obj.obj, (UINT_PTR)host_instance, &client_instance->obj );

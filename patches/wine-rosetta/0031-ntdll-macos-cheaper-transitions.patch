@@ -1,0 +1,79 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -542,6 +542,20 @@
+ static unsigned int xstate_size = sizeof(XSAVE_AREA_HEADER);
+ static UINT64 xstate_extended_features;
+ static LONG syscall_dispatch_enabled = TRUE;
++
++/* deadlock-gptk (macOS): gsbase always holds the pthread TSD here (the TEB fields are mirrored into it at thread
++ * init and nothing switches it back), so the _thread_set_tsd_base call on every syscall / unix call entry rewrites
++ * the value it already has: a kernel trap per transition. WINE_TSD_SWITCH=1 keeps doing it.
++ * The Legends of Runeterra return-address hack (return to the thunk's first ret instead of the one after the call)
++ * makes every syscall return miss Rosetta's return-address prediction; both targets are a ret.
++ * WINE_SYSCALL_RET_HACK=1 restores it. */
++#ifdef __APPLE__
++char wine_mac_tsd_switch = 0;
++char wine_syscall_ret_hack = 0;
++#else
++char wine_mac_tsd_switch = 1;
++char wine_syscall_ret_hack = 1;
++#endif
+ 
+ static inline struct thread_data *get_current_thread_data(void)
+ {
+@@ -2986,6 +3000,13 @@
+  */
+ void signal_init_process( TEB *teb )
+ {
++#ifdef __APPLE__
++    {
++        const char *env;
++        if ((env = getenv( "WINE_TSD_SWITCH" ))) wine_mac_tsd_switch = atoi( env ) != 0;
++        if ((env = getenv( "WINE_SYSCALL_RET_HACK" ))) wine_syscall_ret_hack = atoi( env ) != 0;
++    }
++#endif
+     struct sigaction sig_act;
+     WOW_TEB *wow_teb = get_wow_teb( teb );
+     void *ptr;
+@@ -3274,7 +3295,10 @@
+                    "movl %eax,0xb0(%rcx)\n\t"      /* frame->syscall_id */
+                    /* Legends of Runeterra hooks the first system call return instruction, and
+                     * depends on us returning to it. Adjust the return address accordingly. */
+-                   "subq $0xb,0x70(%rcx)\n\t"
++                   "cmpb $0," __ASM_NAME("wine_syscall_ret_hack") "(%rip)\n\t"
++                   "je 71f\n\t"
++                   "subq $0xb,0x70(%rcx)\n"
++                   "71:\n\t"
+                    "cmpb $0,0x7ffe0285\n\t"        /* user_shared_data->ProcessorFeatures[PF_XSAVE_ENABLED] */
+                    "jz 2f\n\t"
+                    "movl 0x7ffe03d8,%eax\n\t"      /* user_shared_data->XState.EnabledFeatures */
+@@ -3364,10 +3388,13 @@
+                    "leaq -0x98(%rbp),%rcx\n"
+                    "2:\n\t"
+ #elif defined __APPLE__
++                   "cmpb $0," __ASM_NAME("wine_mac_tsd_switch") "(%rip)\n\t"
++                   "je 72f\n\t"
+                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
++                   "syscall\n"
++                   "72:\n\t"
+                    "leaq -0x98(%rbp),%rcx\n"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+@@ -3686,10 +3713,13 @@
+                    "popq %r8\n\t"
+                    "2:\n\t"
+ #elif defined __APPLE__
++                   "cmpb $0," __ASM_NAME("wine_mac_tsd_switch") "(%rip)\n\t"
++                   "je 72f\n\t"
+                    "movq 0x320(%r13),%rdi\n\t"     /* amd64_thread_data()->pthread_teb */
+                    "xorl %esi,%esi\n\t"
+                    "movl $0x3000003,%eax\n\t"      /* _thread_set_tsd_base */
+-                   "syscall\n\t"
++                   "syscall\n"
++                   "72:\n\t"
+ #endif
+                    "ldmxcsr 0x33c(%r13)\n\t"       /* amd64_thread_data()->mxcsr */
+                    "movq %r8,%rdi\n\t"             /* args */

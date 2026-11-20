@@ -1,0 +1,102 @@
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.cpp b/FEXCore/Source/Interface/Core/LookupCache.cpp
+index 0b230306f..645beade5 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.cpp
++++ b/FEXCore/Source/Interface/Core/LookupCache.cpp
+@@ -24,7 +24,10 @@ GuestToHostMap::GuestToHostMap()
+ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
+   : ctx {CTX} {
+ 
+-  TotalCacheSize = ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE + MAX_L1_SIZE;
++  // (athei f7d4fdbb530, lookup-cache part) The L2 cache isn't used when disabled (the default), only allocate the L1
++  // cache then: under Wine the first fault of the overcommit range committed the whole ~272 MB per thread.
++  L2CacheSize = DisableL2Cache() ? 0 : ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE;
++  TotalCacheSize = L2CacheSize + MAX_L1_SIZE;
+ 
+   // Block cache ends up looking like this
+   // PageMemoryMap[VirtualMemoryRegion >> 12]
+@@ -38,25 +41,23 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
+   // Allocate a region of memory that we can use to back our block pointers
+   // We need one pointer per page of virtual memory
+   // At 64GB of virtual memory this will allocate 128MB of virtual memory space
+-  PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
+-  LOGMAN_THROW_A_FMT(PagePointer != -1ULL, "Failed to allocate PagePointer");
++  CacheBase = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
++  LOGMAN_THROW_A_FMT(CacheBase != -1ULL, "Failed to allocate the lookup cache");
+ 
+   // Disable THP on the Lookup cache.
+-  FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(PagePointer), TotalCacheSize, FEXCore::Allocator::THPControl::Disable);
++  FEXCore::Allocator::VirtualTHPControl(reinterpret_cast<const void*>(CacheBase), TotalCacheSize, FEXCore::Allocator::THPControl::Disable);
+ 
+-  FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer),
+-                                  ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE);
+-  CTX->SyscallHandler->MarkOvercommitRange(PagePointer, TotalCacheSize);
++  CTX->SyscallHandler->MarkOvercommitRange(CacheBase, TotalCacheSize);
+ 
+-  // Allocate our memory backing our pages
+-  // We need 32KB per guest page (One pointer per byte)
+-  // XXX: We can drop down to 16KB if we store 4byte offsets from the code base
+-  // We currently limit to 128MB of real memory for caching for the total cache size.
+-  // Can end up being inefficient if we compile a small number of blocks per page
+-  PageMemory = PagePointer + ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8;
++  if (L2CacheSize) {
++    PagePointer = CacheBase;
++    FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer), L2CacheSize);
++    // We need 32KB per guest page (One pointer per byte)
++    PageMemory = PagePointer + ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8;
++  }
+ 
+   // L1 Cache
+-  L1Pointer = PageMemory + CODE_SIZE;
++  L1Pointer = CacheBase + L2CacheSize;
+   FEXCore::Allocator::VirtualName("FEXMem_Lookup_L1", reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE);
+ 
+   VirtualMemSize = ctx->Config.VirtualMemSize;
+@@ -71,8 +72,8 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
+ }
+ 
+ LookupCache::~LookupCache() {
+-  FEXCore::Allocator::VirtualFree(reinterpret_cast<void*>(PagePointer), TotalCacheSize);
+-  ctx->SyscallHandler->UnmarkOvercommitRange(PagePointer, TotalCacheSize);
++  FEXCore::Allocator::VirtualFree(reinterpret_cast<void*>(CacheBase), TotalCacheSize);
++  ctx->SyscallHandler->UnmarkOvercommitRange(CacheBase, TotalCacheSize);
+ 
+   // No need to free BlockLinks map.
+   // These will get freed when their memory allocators are deallocated.
+@@ -81,15 +82,16 @@ LookupCache::~LookupCache() {
+ void LookupCache::ClearL2Cache(const FEXCore::LookupCacheBaseLockToken& lk) {
+   // Clear out the page memory
+   // PagePointer and PageMemory are sequential with each other. Clear both at once.
+-  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer),
+-                                      ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8 + CODE_SIZE, false);
++  if (L2CacheSize) {
++    FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer), L2CacheSize, false);
++  }
+   AllocateOffset = 0;
+ }
+ 
+ void LookupCache::ClearThreadLocalCaches(const LookupCacheWriteLockToken&) {
+   // TODO: Preserve code cache entries?
+   // Clear L1 and L2 by clearing the full cache.
+-  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(PagePointer), TotalCacheSize, false);
++  FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(CacheBase), TotalCacheSize, false);
+ 
+   // TODO: Rename this member to avoid confusion with code caching
+   CachedCodePages.clear();
+diff --git a/FEXCore/Source/Interface/Core/LookupCache.h b/FEXCore/Source/Interface/Core/LookupCache.h
+index 391d48560..d3222f4d5 100644
+--- a/FEXCore/Source/Interface/Core/LookupCache.h
++++ b/FEXCore/Source/Interface/Core/LookupCache.h
+@@ -453,8 +453,11 @@ private:
+   // Maps from a page index to all blocks in the page that have at some point been fetched into L1/L2
+   fextl::map<uint64_t, fextl::robin_set<uint64_t>> CachedCodePages;
+ 
+-  uintptr_t PagePointer;
+-  uintptr_t PageMemory;
++  // The L2 cache (PagePointer and PageMemory) followed by the L1 cache, without L2 when it is disabled.
++  uintptr_t CacheBase {};
++  uintptr_t PagePointer {};
++  uintptr_t PageMemory {};
++  uint64_t L2CacheSize {};
+   uintptr_t L1Pointer;
+   uintptr_t L1PointerMask;
+ 

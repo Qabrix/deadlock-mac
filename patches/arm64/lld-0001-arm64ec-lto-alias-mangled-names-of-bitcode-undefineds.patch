@@ -1,0 +1,27 @@
+--- a/lld/COFF/InputFiles.cpp
++++ b/lld/COFF/InputFiles.cpp
+@@ -1419,6 +1419,24 @@
+       sym = symtab.addUndefined(symName, this, false);
+       if (objSym.isWeak())
+         sym->deferUndefined = true;
++      // On ARM64EC, code generation turns a call to an external function into
++      // a reference to its mangled name (#func) plus an anti-dependency alias
++      // func -> #func, and ARM64EC archives index only the mangled name. The
++      // bitcode symbol table has just the demangled name, so without the same
++      // alias here, archive members that LTO-generated code needs (e.g.
++      // libc++'s __gxx_personality_seh0) are never loaded and the mangled
++      // references stay undefined after LTO.
++      if (symtab.isEC() && objSym.isExecutable()) {
++        if (std::optional<std::string> mangledName =
++                getArm64ECMangledFunctionName(symName)) {
++          auto *u = dyn_cast<Undefined>(sym);
++          if (u && !u->weakAlias) {
++            Symbol *t =
++                symtab.addUndefined(saver.save(*mangledName), this, false);
++            u->setWeakAlias(t, true);
++          }
++        }
++      }
+       // If one LTO object file references (i.e. has an undefined reference to)
+       // a symbol with an __imp_ prefix, the LTO compilation itself sees it
+       // as unprefixed but with a dllimport attribute instead, and doesn't

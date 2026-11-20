@@ -1,0 +1,41 @@
+diff --git a/server/main.c b/server/main.c
+index 19127ce..5fbc21a 100644
+--- a/server/main.c
++++ b/server/main.c
+@@ -41,6 +41,10 @@
+ #include "request.h"
+ #include "unicode.h"
+ #include "msync.h"
++#ifdef __APPLE__
++#include <mach/mach.h>
++#include <mach/thread_policy.h>
++#endif
+ 
+ /* command-line options */
+ int debug_level = 0;
+@@ -269,6 +273,25 @@ int main( int argc, char *argv[] )
+     init_directories( load_intl_file() );
+     init_threading();
+     init_registry();
++#ifdef __APPLE__
++    /* deadlock-gptk: WINE_SERVER_QOS=N (1 = 16) raises the request loop's Mach precedence by N.
++     * Client threads block on every server call; at default priority the server queues behind
++     * the game's busy audio/render/job threads on saturated performance cores. (QoS classes
++     * don't apply to a process's main thread here, precedence does.) */
++    {
++        const char *env = getenv( "WINE_SERVER_QOS" );
++        int boost = env ? atoi( env ) : 0;
++        if (boost > 0)
++        {
++            thread_precedence_policy_data_t precedence = { .importance = boost == 1 ? 16 : boost };
++            integer_t latency = LATENCY_QOS_TIER_0;
++            thread_policy_set( mach_thread_self(), THREAD_LATENCY_QOS_POLICY, (thread_policy_t)&latency,
++                               THREAD_LATENCY_QOS_POLICY_COUNT );
++            thread_policy_set( mach_thread_self(), THREAD_PRECEDENCE_POLICY, (thread_policy_t)&precedence,
++                               THREAD_PRECEDENCE_POLICY_COUNT );
++        }
++    }
++#endif
+     main_loop();
+     return 0;
+ }

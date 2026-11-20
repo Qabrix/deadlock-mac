@@ -1,0 +1,21 @@
+--- a/dlls/winemac.drv/d3dmetal.c	2026-10-13 01:03:54
++++ b/dlls/winemac.drv/d3dmetal.c	2026-10-13 01:03:54
+@@ -311,7 +311,8 @@
+     return result;
+ }
+ 
+-static LSTATUS WINAPI DECLSPEC_HOTPATCH RegCloseKey( HKEY hkey )
++/* deadlock-gptk: renamed; a static RegCloseKey clashes with winreg.h's declaration (clang 17 error) */
++static LSTATUS WINAPI d3dm_RegCloseKey( HKEY hkey )
+ {
+     if (!hkey) return ERROR_INVALID_HANDLE;
+     if (hkey >= (HKEY)0x80000000) return ERROR_SUCCESS;
+@@ -321,7 +322,7 @@
+ static LSTATUS WINAPI my_RegCloseKey(HKEY hkey)
+ {
+     TRACE("RegCloseKey %p\n", hkey);
+-    return RegCloseKey(hkey);
++    return d3dm_RegCloseKey(hkey);
+ }
+ 
+ static BOOL WINAPI my_EnumDisplayMonitors(HDC h, LPRECT p2, MONITORENUMPROC p3, LPARAM p4)

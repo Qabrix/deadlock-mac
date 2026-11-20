@@ -1,0 +1,71 @@
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2609,6 +2609,54 @@
+ }
+ 
+ 
++#if defined(__APPLE__) && defined(HAVE_KQUEUE)
++/* deadlock-gptk: macOS gives select() timeouts 12-25 % leeway: Deadlock's fps_max limiter sleeps 2-13 ms on the
++ * main thread and a 10 ms sleep woke ~2.5 ms late (frames at the 60 fps cap came out 18-22 ms). Sleeps up to
++ * WINE_PRECISE_SLEEP_US (default 20000, 0 = off) wait on a per-thread kqueue timer marked NOTE_CRITICAL instead
++ * (~30 us late); longer ones keep the leeway. Returns 1 slept, 0 interrupted (the caller recomputes the rest), -1
++ * not used. */
++static pthread_key_t precise_sleep_key;
++static pthread_once_t precise_sleep_once = PTHREAD_ONCE_INIT;
++
++static void precise_sleep_close( void *arg )
++{
++    close( (int)(intptr_t)arg - 1 );
++}
++
++static void precise_sleep_init(void)
++{
++    pthread_key_create( &precise_sleep_key, precise_sleep_close );
++}
++
++static int precise_sleep( timeout_t diff_us )
++{
++    static long max_us = -1;
++    struct kevent ev, out;
++    int kq, ret;
++
++    if (max_us < 0)
++    {
++        const char *env = getenv( "WINE_PRECISE_SLEEP_US" );
++        long v = env ? atol( env ) : 20000;
++        max_us = v > 0 ? v : 0;
++    }
++    if (diff_us > max_us) return -1;
++    pthread_once( &precise_sleep_once, precise_sleep_init );
++    kq = (int)(intptr_t)pthread_getspecific( precise_sleep_key ) - 1;
++    if (kq < 0)
++    {
++        if ((kq = kqueue()) < 0) return -1;
++        fcntl( kq, F_SETFD, FD_CLOEXEC );
++        pthread_setspecific( precise_sleep_key, (void *)(intptr_t)(kq + 1) );
++    }
++    EV_SET( &ev, 1, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_USECONDS | NOTE_CRITICAL, diff_us, NULL );
++    ret = kevent( kq, &ev, 1, &out, 1, NULL );
++    if (ret > 0) return 1;
++    return (ret < 0 && errno == EINTR) ? 0 : -1;
++}
++#endif
++
++
+ /******************************************************************
+  *		NtDelayExecution (NTDLL.@)
+  */
+@@ -2652,6 +2700,13 @@
+             NtQuerySystemTime( &now );
+             diff = (when - now.QuadPart + 9) / 10;
+             if (diff <= 0) break;
++#if defined(__APPLE__) && defined(HAVE_KQUEUE)
++            {
++                int r = precise_sleep( diff );
++                if (r > 0) break;
++                if (r == 0) continue;
++            }
++#endif
+             tv.tv_sec  = diff / 1000000;
+             tv.tv_usec = diff % 1000000;
+             if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;

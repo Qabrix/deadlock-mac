@@ -1,0 +1,54 @@
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2583,13 +2583,51 @@
+     select_op.signal_and_wait.signal = wine_server_obj_handle( signal );
+     return server_wait( &select_op, sizeof(select_op.signal_and_wait), flags, timeout );
+ }
++
++
++#if defined(__APPLE__) && defined(HAVE_KQUEUE)
++static int precise_sleep( timeout_t diff_us );
+ 
++/* deadlock-gptk: WINE_YIELD_SLEEP_US=N (default 0 = off): a thread that keeps yielding - Sleep(0), SwitchToThread
++ * or NtYieldExecution in a spin loop, i.e. at least 16 yields each less than 200 us after the previous one - sleeps
++ * N us on the precise timer instead of sched_yield(), so the core can idle or run other work (Apple's CPU guide:
++ * block instead of spinning or yielding). A gap of 200 us or more (the thread did real work) ends the run. */
++static BOOL yield_sleep(void)
++{
++    static long sleep_us = -1;
++    static __thread uint64_t last_ns;
++    static __thread unsigned int run;
++    uint64_t now;
++
++    if (sleep_us < 0)
++    {
++        const char *env = getenv( "WINE_YIELD_SLEEP_US" );
++        long v = env ? atol( env ) : 0;
++        sleep_us = v > 0 ? (v < 20000 ? v : 20000) : 0;
++    }
++    if (!sleep_us) return FALSE;
++    now = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
++    run = (now - last_ns < 200000) ? run + 1 : 0;
++    last_ns = now;
++    if (run < 16) return FALSE;
++    if (precise_sleep( sleep_us ) < 0)
++    {
++        struct timespec ts = { 0, sleep_us * 1000 };
++        nanosleep( &ts, NULL );
++    }
++    last_ns = clock_gettime_nsec_np( CLOCK_UPTIME_RAW );
++    return TRUE;
++}
++#endif
+ 
+ /******************************************************************
+  *		NtYieldExecution (NTDLL.@)
+  */
+ NTSTATUS WINAPI NtYieldExecution(void)
+ {
++#if defined(__APPLE__) && defined(HAVE_KQUEUE)
++    if (yield_sleep()) return STATUS_SUCCESS;
++#endif
+ #ifdef HAVE_SCHED_YIELD
+ #ifdef RUSAGE_THREAD
+     struct rusage u1, u2;

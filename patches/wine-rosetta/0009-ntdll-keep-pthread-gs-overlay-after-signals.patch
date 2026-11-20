@@ -1,0 +1,18 @@
+--- a/dlls/ntdll/unix/signal_x86_64.c	2026-10-13 04:07:00
++++ b/dlls/ntdll/unix/signal_x86_64.c	2026-10-13 04:07:00
+@@ -829,9 +829,12 @@
+         if (fs32_sel) __asm__ volatile( "movw %0,%%fs" :: "r" (fs32_sel) );
+     }
+ #elif defined __APPLE__
+-    if (!is_inside_signal_stack( data, (void *)RSP_sig(sigcontext )) &&
+-        !is_inside_syscall( data, RSP_sig(sigcontext )))
+-        _thread_set_tsd_base( (uint64_t)data->teb );
++    /* deadlock-gptk: no GSBASE=TEB switch on macOS. This tree keeps CrossOver's pthread GS
++     * overlay (TEB Self/TLS/PEB mirrored into the pthread TSD at thread init; Rosetta's
++     * non-native code regions cover registered PE code). Switching GSBASE to the TEB after a
++     * signal broke native code on Wine threads -- GPTK 4's D3DMetal worker threads then saw a
++     * foreign TSD in os_unfair_lock / os_sync_wait_on_address and crashed Deadlock ~20 s in.
++     * CrossOver 26.3 has no such switch either. */
+ #endif
+     if (is_16bit( sigcontext )) return;
+ #ifdef DS_sig

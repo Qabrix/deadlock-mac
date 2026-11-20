@@ -1,0 +1,25 @@
+--- a/dlls/winemac.drv/cocoa_window.m	2026-10-13 04:05:18
++++ b/dlls/winemac.drv/cocoa_window.m	2026-10-13 04:05:18
+@@ -3981,6 +3981,11 @@
+     CALayer* c = container_layer;
+     CAMetalLayer* o = offscreen_layer;
+ 
++    /* deadlock-gptk (winecx-gptk#11): Win32 rects are backing pixels with RetinaMode=y but
++     * layer geometry is in points; convert like the in-process macdrv_set_view_frame(). */
++    container = cgrect_mac_from_win(container);
++    frame = cgrect_mac_from_win(frame);
++
+     /* no implicit animation, a resize must land in one frame */
+     [CATransaction begin];
+     [CATransaction setDisableActions:YES];
+@@ -3989,6 +3994,10 @@
+     o.bounds = CGRectMake(0, 0, CGRectGetWidth(frame), CGRectGetHeight(frame));
+     o.position = CGPointMake(CGRectGetMinX(frame), CGRectGetMinY(frame));
+     [CATransaction commit];
++    /* deadlock-gptk (winecx-gptk#11): this runs on the presenting thread, which has no run
++     * loop; the CAMetalLayer calls leave an implicit transaction open that never commits, so
++     * new geometry (e.g. Steam's popup menus, created 2x1 px) never reaches the render server. */
++    [CATransaction flush];
+ }
+ 
+ - (CAMetalLayer*) layer

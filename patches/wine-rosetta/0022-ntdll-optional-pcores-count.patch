@@ -1,0 +1,17 @@
+--- a/dlls/ntdll/unix/system.c	2026-10-15 00:56:18
++++ b/dlls/ntdll/unix/system.c	2026-10-17 22:16:02
+@@ -1420,7 +1420,13 @@
+             performance_cores_capacity = (cores_no + 31) / 32;
+             if ((performance_cores = calloc(performance_cores_capacity, sizeof(*performance_cores))))
+             {
+-                for (i = efficiency_count; i < cores_no; i++)
++                /* deadlock-gptk: WINE_MACOS_PCORES=N reports only the top N performance cores as
++                 * such; the game then starts fewer performance workers, fewer P-cores are busy and
++                 * the power-limited P-cluster keeps a higher clock for the main thread. */
++                unsigned int pcount = performance_count;
++                const char *pc = getenv("WINE_MACOS_PCORES");
++                if (pc && atoi(pc) >= 1 && atoi(pc) <= (int)performance_count) pcount = atoi(pc);
++                for (i = cores_no - pcount; i < cores_no; i++)
+                     performance_cores[i / 32] |= 1u << (i % 32);
+                 TRACE("%u efficiency cores, %u performance cores\n",
+                         efficiency_count, performance_count);

@@ -1,0 +1,36 @@
+--- a/dlls/ntdll/unix/loader.c	2026-10-13 13:18:58
++++ b/dlls/ntdll/unix/loader.c	2026-10-13 13:18:58
+@@ -613,6 +613,18 @@
+     return ret;
+ }
+ 
++/* deadlock-gptk: WINE_GAMEMODE_EXE=<name.exe> + WINE_GAMEMODE_LOADER=<path> start that one
++ * program with another copy of the loader, e.g. one inside a games-category app bundle, so
++ * macOS attributes only the game to the bundle (Game Mode) and not its launcher's processes.
++ * Children of the game inherit that loader through ntdll's own path. */
++static const char *gamemode_loader(const char *image_path)
++{
++    const char *loader = getenv("WINE_GAMEMODE_LOADER"), *exe = getenv("WINE_GAMEMODE_EXE");
++
++    if (!loader || !loader[0] || !exe || !exe[0] || !image_path || !image_is(image_path, exe)) return NULL;
++    return loader;
++}
++
+ static void replace_wineloader_path_with_link(char **wineloader_path, const char *image_path)
+ {
+     char *app_name = get_app_display_name(image_path);
+@@ -677,7 +689,14 @@
+ 
+     if (((argv[1] = get_alternate_wineloader( machine )))) preloader_exec( argv, image_path );
+ 
++#ifdef __APPLE__
++    {
++        const char *loader = gamemode_loader( image_path );
++        argv[1] = strdup( loader ? loader : wineloader );
++    }
++#else
+     argv[1] = strdup( wineloader );
++#endif
+     preloader_exec( argv, image_path );
+     return STATUS_INVALID_IMAGE_FORMAT;
+ }

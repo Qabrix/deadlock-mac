@@ -1,0 +1,25 @@
+--- a/dlls/d3d9/d3d9_main.c	2026-10-23 00:55:20
++++ b/dlls/d3d9/d3d9_main.c	2026-10-23 00:55:27
+@@ -226,7 +226,11 @@
+ {
+     TRACE("color 0x%08lx, name %s.\n", color, debugstr_w(name));
+ 
+-    return D3DPERF_event_level++;
++    /* deadlock-gptk: Windows' d3d9 returns a negative value when no profiler (PIX/Nsight) is attached. Source 2's
++     * PIX check ("TestActive") treats >= 0 as an attached profiler and then skips its vendor extensions (NvAPI,
++     * so NVIDIA Reflex, and AMD AGS/Anti-Lag 2). */
++    D3DPERF_event_level++;
++    return -1;
+ }
+ 
+ /***********************************************************************
+@@ -235,7 +239,8 @@
+ int WINAPI D3DPERF_EndEvent(void) {
+     TRACE("(void) : stub\n");
+ 
+-    return --D3DPERF_event_level;
++    --D3DPERF_event_level;
++    return -1;
+ }
+ 
+ /***********************************************************************

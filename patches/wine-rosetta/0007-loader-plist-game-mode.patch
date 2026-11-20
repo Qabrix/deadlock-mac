@@ -1,0 +1,15 @@
+--- a/loader/wine_info.plist.in
++++ b/loader/wine_info.plist.in
+@@ -24,6 +24,12 @@
+     <string>@PACKAGE_VERSION@</string>
+     <key>NSPrincipalClass</key>
+     <string>WineApplication</string>
++    <key>LSApplicationCategoryType</key>
++    <string>public.app-category.games</string><!-- deadlock-gptk: Game Mode eligibility -->
++    <key>LSSupportsGameMode</key>
++    <true/>
++    <key>GCSupportsGameMode</key>
++    <true/>
+     <key>LSUIElement</key>
+     <string>1</string>
+ </dict>

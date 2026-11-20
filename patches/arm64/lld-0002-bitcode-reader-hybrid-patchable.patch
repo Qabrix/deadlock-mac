@@ -1,0 +1,11 @@
+--- a/llvm/lib/Bitcode/Reader/BitcodeReader.cpp
++++ b/llvm/lib/Bitcode/Reader/BitcodeReader.cpp
+@@ -2316,6 +2316,8 @@
+     return Attribute::DeadOnUnwind;
+   case bitc::ATTR_KIND_RANGE:
+     return Attribute::Range;
++  case bitc::ATTR_KIND_HYBRID_PATCHABLE:
++    return Attribute::HybridPatchable;
+   case bitc::ATTR_KIND_INITIALIZES:
+     return Attribute::Initializes;
+   case bitc::ATTR_KIND_CORO_ELIDE_SAFE:

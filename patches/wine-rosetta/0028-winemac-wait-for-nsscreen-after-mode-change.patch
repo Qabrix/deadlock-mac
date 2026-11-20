@@ -1,0 +1,38 @@
+--- a/dlls/winemac.drv/cocoa_app.m	2026-10-23 02:13:24
++++ b/dlls/winemac.drv/cocoa_app.m	2026-10-23 02:13:34
+@@ -2890,7 +2890,35 @@
+     OnMainThread(^{
+         ret = [[WineApplicationController sharedController] setMode:display_mode forDisplay:displayID];
+     });
++
++    /* deadlock-gptk: AppKit refreshes [NSScreen screens] only after the main thread has processed the display
++     * reconfiguration, but win32u re-reads the monitor rects (macdrv_get_monitors: NSScreen frames) right after
++     * ChangeDisplaySettings returns. A game entering exclusive fullscreen then sizes its window to the previous
++     * mode's rect (larger than the new screen) and starts cropped until it re-enters fullscreen; the later
++     * DISPLAYS_CHANGED only reaches the desktop window. So wait (at most 2 s) until NSScreen reports the new
++     * mode's size; each OnMainThread round trip lets the main run loop process the reconfiguration. */
++    if (ret && display_mode)
++    {
++        CGFloat want_width = CGDisplayModeGetWidth(display_mode), want_height = CGDisplayModeGetHeight(display_mode);
++        int i;
++
++        for (i = 0; i < 200; i++)
++        {
++            __block BOOL done = TRUE;
+ 
++            OnMainThread(^{
++                for (NSScreen* screen in [NSScreen screens])
++                {
++                    if ([[screen deviceDescription][@"NSScreenNumber"] unsignedIntValue] != displayID) continue;
++                    done = screen.frame.size.width == want_width && screen.frame.size.height == want_height;
++                    break;
++                }
++            });
++            if (done) break;
++            [NSThread sleepForTimeInterval:0.01];
++        }
++    }
++
+     return ret;
+ }
+ 

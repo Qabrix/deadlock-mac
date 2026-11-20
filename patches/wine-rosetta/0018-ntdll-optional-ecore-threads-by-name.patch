@@ -1,0 +1,53 @@
+--- a/dlls/ntdll/unix/thread.c	2026-10-13 01:08:29
++++ b/dlls/ntdll/unix/thread.c	2026-10-17 19:50:53
+@@ -2095,7 +2095,42 @@
+     if (!once++) FIXME("not implemented on this platform\n");
+     return FALSE;
+ #endif
++}
++
++#ifdef __APPLE__
++#include <sys/resource.h>
++#include <pthread/qos.h>
++/* deadlock-gptk: WINE_ECORE_THREADS="GlobPool/P,AudioMixer" (name prefixes) moves the threads that name
++ * themselves so onto the efficiency cores: darwin background (default, strictly E-cores) or
++ * WINE_ECORE_MODE=utility (QoS utility, E-preferred). With fewer busy performance cores the P-cluster
++ * keeps a higher clock for the threads left there (MainThrd). */
++static void ecore_for_thread_name( const char *name )
++{
++    static char list[512];
++    static int mode = -1;
++    const char *p;
++
++    if (mode < 0)
++    {
++        const char *e = getenv( "WINE_ECORE_THREADS" ), *m = getenv( "WINE_ECORE_MODE" );
++        if (e) snprintf( list, sizeof(list), "%s", e );
++        mode = (m && !strcmp( m, "utility" )) ? 1 : 0;
++    }
++    for (p = list; *p; )
++    {
++        const char *end = strchr( p, ',' );
++        size_t len = end ? (size_t)(end - p) : strlen( p );
++        if (len && !strncmp( name, p, len ))
++        {
++            if (mode) pthread_set_qos_class_self_np( QOS_CLASS_UTILITY, 0 );
++            else setpriority( PRIO_DARWIN_THREAD, 0, PRIO_DARWIN_BG );
++            return;
++        }
++        if (!end) break;
++        p = end + 1;
++    }
+ }
++#endif
+ 
+ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
+ {
+@@ -2158,6 +2193,7 @@
+     len = ntdll_wcstoumbs( name->Buffer, name->Length / sizeof(WCHAR), nameA, sizeof(nameA) - 1, FALSE );
+     nameA[len] = '\0';
+     pthread_setname_np( nameA );
++    ecore_for_thread_name( nameA );
+ #elif defined(__FreeBSD__)
+     unsigned int status;
+     char nameA[64];

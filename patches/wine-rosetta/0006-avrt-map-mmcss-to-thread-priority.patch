@@ -1,0 +1,42 @@
+--- a/dlls/avrt/main.c
++++ b/dlls/avrt/main.c
+@@ -26,6 +26,19 @@
+ #include "avrt.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(avrt);
++
++/* deadlock-gptk: Windows' MMCSS boosts registered threads ("Pro Audio", "Audio", "Games").
++ * Map them to thread priorities, which wineserver turns into macOS QoS / time-constraint
++ * scheduling, instead of leaving game audio threads at normal priority. WINE_MMCSS=0: off. */
++static int mmcss_priority(const WCHAR *name)
++{
++    WCHAR env[8];
++    if (GetEnvironmentVariableW(L"WINE_MMCSS", env, ARRAY_SIZE(env)) && env[0] == '0') return THREAD_PRIORITY_ERROR_RETURN;
++    if (!wcsicmp(name, L"Pro Audio") || !wcsicmp(name, L"Audio") || !wcsicmp(name, L"Capture") ||
++        !wcsicmp(name, L"Playback")) return THREAD_PRIORITY_TIME_CRITICAL;
++    if (!wcsicmp(name, L"Games") || !wcsicmp(name, L"Window Manager")) return THREAD_PRIORITY_HIGHEST;
++    return THREAD_PRIORITY_ERROR_RETURN;
++}
+ 
+ static inline WCHAR *strdupAW(const char *src)
+ {
+@@ -70,6 +83,11 @@
+         return NULL;
+     }
+ 
++    {
++        int prio = mmcss_priority(name);
++        if (prio != THREAD_PRIORITY_ERROR_RETURN && SetThreadPriority(GetCurrentThread(), prio))
++            TRACE("%s: thread priority %d\n", debugstr_w(name), prio);
++    }
+     return (HANDLE)0x12345678;
+ }
+ 
+@@ -82,6 +100,7 @@
+ BOOL WINAPI AvRevertMmThreadCharacteristics(HANDLE AvrtHandle)
+ {
+     FIXME("(%p): stub\n", AvrtHandle);
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+     return TRUE;
+ }
+ 
