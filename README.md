@@ -69,8 +69,8 @@ The launcher offers two ways to run the game:
 
 Both use the same game files, settings, keybinds and hero builds.
 
-**Recommended: Rosetta.** On the test Mac (below) it was clearly faster: about 50 fps against about 39 fps on ARM64
-in comparable fights, and it has no hitching phase at the start. ARM64 is there for experimenting, and as the way
+**Recommended: Rosetta.** On the test Mac (below) it ran better in our matches: higher frame rates, and smoother
+even after ARM64's code cache had warmed up; it also has no hitching phase at the start. ARM64 is there for experimenting, and as the way
 forward once Apple phases Rosetta out (macOS 27 is the last release with full Rosetta support).
 
 ## Settings that adapt to your Mac
