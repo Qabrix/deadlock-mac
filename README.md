@@ -16,6 +16,21 @@ measured in real matches.
 - About 55 GB of free disk space (game, runtimes, shader caches).
 - A Steam account with Deadlock in its library.
 
+## Tested on
+
+| | |
+|---|---|
+| Mac | MacBook Air 15-inch (M4, 2025), fanless |
+| Chip | Apple M4: 10-core CPU (4 performance + 6 efficiency cores), 10-core GPU |
+| Memory | 24 GB |
+| Display | built-in 2880 × 1864 |
+| macOS | 27.0.1 |
+| Cooling | **thermal-pad mod** (thermal pads that let the chassis take more heat from the chip) |
+
+On this Mac, with DLSS Performance and low graphics settings: 60 fps (the cap) in early fights, around 50 fps in
+late-game fights once the Air heats up. A fanless Air slows its CPU when the case gets warm, so an unmodified Air
+will drop sooner; a Mac with a fan (MacBook Pro, Mac mini, Mac Studio) holds its speed much longer.
+
 ## Install
 
 Open Terminal and paste:
@@ -52,8 +67,11 @@ The launcher offers two ways to run the game:
 | Needs | nothing else | **Mac Steam** running and logged in (the game talks to it); Windows Steam still downloads game updates |
 | First matches | smooth | can hitch for ~15 minutes while FEX fills its code cache |
 
-Both use the same game files, settings, keybinds and hero builds. Rosetta is the simpler choice; ARM64 avoids
-Rosetta (which Apple is phasing out) and uses less CPU in some scenes. Try both on your Mac.
+Both use the same game files, settings, keybinds and hero builds.
+
+**Recommended: Rosetta.** On the test Mac (below) it was clearly faster: about 50 fps against about 39 fps on ARM64
+in comparable fights, and it has no hitching phase at the start. ARM64 is there for experimenting, and as the way
+forward once Apple phases Rosetta out (macOS 27 is the last release with full Rosetta support).
 
 ## Settings that adapt to your Mac
 
