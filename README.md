@@ -2,7 +2,7 @@
 
 Play [Deadlock](https://store.steampowered.com/app/1422450/Deadlock/) on an Apple-silicon Mac, with a launcher and a
 runtime tuned for it: our own builds of Wine and of [DXMT](https://github.com/3Shain/dxmt) (Direct3D 11 on Metal), with
-DLSS running on Apple's MetalFX, NVIDIA Reflex pacing, MetalFX frame generation and a lot of smaller CPU and GPU savings
+DLSS running on Apple's MetalFX, NVIDIA Reflex pacing and a lot of smaller CPU and GPU savings
 measured in real matches.
 
 > **Unofficial.** Not made or endorsed by Valve, Apple or CodeWeavers. Deadlock has no Mac version; this runs the
@@ -101,7 +101,7 @@ The defaults were tuned on a fanless MacBook Air M4. On first use the launcher d
 | balanced | M1–M5 with a fan (MacBook Pro, mini, iMac) | no frame cap |
 | performance | Pro, Max and Ultra chips | no frame cap |
 
-Reflex pacing and frame generation follow your display's refresh rate (60 Hz, 120 Hz ProMotion, …). The launcher
+Reflex pacing follows your display's refresh rate (60 Hz, 120 Hz ProMotion, …). The launcher
 shows a suggestion for the in-game settings that fit your tier.
 
 ## Options
@@ -112,7 +112,7 @@ shows a suggestion for the in-game settings that fit your tier.
 | Parkour helpers | `--parkour` | on `sv_cheats` maps: **Q** checkpoint, **E** teleport back + restart the stopwatch, **T** stopwatch start/stop, **H** clear; the stopwatch is drawn into the game's frame |
 | Scroll-wheel jump helpers | `--wheel` | for Jump bound to both Space and the wheel: one wheel flick = one jump, the wheel works while Space is held, a quick double Space makes the wheel raw for wall jumps |
 | DLSS | `--no-dlss` | DLSS (MetalFX) once the toolkit file is imported |
-| Frame generation | `--framegen auto\|1` | macOS 26+, with DLSS: MetalFX frame interpolation; *auto* only fills refreshes the game misses |
+| Frame generation (experimental) | `--framegen auto\|1` | **not recommended for now**: still buggy and adds input latency. Off by default; macOS 26+, with DLSS |
 | VSync | `--vsync` | even frame pacing; default is the lowest-latency presentation |
 | Metal HUD | `--hud` | Apple's performance overlay |
 | Show Steam's window | `--steam-window` | Rosetta: Steam's window visible (it is hidden by default because drawing it costs ~1 CPU core in matches) |

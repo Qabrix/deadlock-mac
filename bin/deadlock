@@ -8,7 +8,8 @@
 #     --wheel                 scroll-wheel jump helpers (Jump bound to Space and the wheel)
 #     --no-dlss               don't offer DLSS (default: on once Apple's nvngx.dll is imported, deadlock gptk)
 #     --vsync                 present in step with the display (default: lowest latency)
-#     --framegen auto|1       MetalFX frame generation (macOS 26+, needs DLSS selected in game)
+#     --framegen auto|1       EXPERIMENTAL, not recommended: MetalFX frame generation is buggy and adds input latency
+#                             (macOS 26+, needs DLSS selected in game)
 #     --hud                   Metal performance HUD
 #     --steam-window          Rosetta: Steam's window visible (needed to answer its dialogs)
 #     --overlay               Rosetta: Steam overlay (Shift+Tab) on (costs CPU)
@@ -63,6 +64,7 @@ if [[ $cmd == play ]]; then
   if [[ -n $FRAMEGEN ]]; then
     hw_detect
     (( HW_FRAMEGEN )) || die "frame generation needs macOS 26 or newer (this Mac: $HW_MACOS)"
+    warn "frame generation is experimental: expect visual glitches and more input latency"
   fi
   mkdir -p "$DL_ROOT"; print -r -- $GAME_PATH > "$PATH_FILE"
   case $GAME_PATH in

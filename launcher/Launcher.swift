@@ -226,7 +226,7 @@ struct LauncherView: View {
       if flag("dlss") {
         Toggle("DLSS (MetalFX)", isOn: $dlss)
         if dlss && flag("framegen") {
-          Picker("Frame generation", selection: $framegen) {
+          Picker("Frame generation (experimental: buggy, adds latency)", selection: $framegen) {
             Text("Off").tag("")
             Text("Fill missed refreshes").tag("auto")
             Text("Always (2x)").tag("1")

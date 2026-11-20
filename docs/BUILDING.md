@@ -36,7 +36,7 @@ What the patches do, in short:
   transitions, CoreAudio minimum period and mix rate, MMCSS priorities, relative mouse-look without coalescing,
   scroll-wheel jump gating, the console channel used by `--map` and the parkour helpers (with the stopwatch drawn by
   DXMT into the frame), a modern driver version for DLSS.
-- **DXMT:** DLSS on MetalFX Temporal, NVIDIA Reflex pacing in nvapi64, MetalFX frame generation that keeps the UI out
+- **DXMT:** DLSS on MetalFX Temporal, NVIDIA Reflex pacing in nvapi64, MetalFX frame generation (experimental) that keeps the UI out
   of interpolation, CAS sharpening, vsync pacing, render-pass merging and trimming, lossless render targets,
   front-end trims, frame-time logs.
 - **FEX:** AFP off for ARM64EC with the RPRES fix, an L1-only lookup cache, x86 memory order exactly where Source 2's
