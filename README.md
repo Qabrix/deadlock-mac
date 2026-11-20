@@ -24,7 +24,7 @@ measured in real matches.
 | Chip | Apple M4: 10-core CPU (4 performance + 6 efficiency cores), 10-core GPU |
 | Memory | 24 GB |
 | Display | built-in 2880 × 1864 panel |
-| Game resolution | 1710 × 1068 (DLSS Performance: rendered at 855 × 534, upscaled to 1710 × 1068) |
+| Game resolution | 1710 × 1068 |
 | macOS | 27.0.1 |
 | Cooling | **thermal-pad mod** (thermal pads that let the chassis take more heat from the chip) |
 
