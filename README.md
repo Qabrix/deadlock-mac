@@ -51,12 +51,29 @@ The launcher walks you through it:
 1. **Windows Steam in Wine**: one click, a few minutes.
 2. **Log in and download Deadlock**: Steam's window opens; log in and confirm the install (~40 GB). The launcher notices
    when the game is there.
-3. **DLSS (optional)**: needs one file from Apple's free
-   [Game Porting Toolkit](https://developer.apple.com/games/game-porting-toolkit/) (free Apple account). Download the
-   `.dmg`, click *Choose .dmg…* in the launcher, and select DLSS in the game's video settings afterwards. Without it
+3. **DLSS (optional)**: needs one file from Apple's free Game Porting Toolkit, see [DLSS](#dlss) below. Without it
    the game uses its own upscaler (FSR or *stretch*).
 
 Then press **Play**.
+
+## DLSS
+
+DLSS runs on Apple's MetalFX upscaler here, but the game only turns it on when it finds Apple's signed `nvngx.dll`.
+That file comes with Apple's free Game Porting Toolkit and may not be shared, so you import it once yourself:
+
+1. Open [developer.apple.com/games/game-porting-toolkit](https://developer.apple.com/games/game-porting-toolkit/)
+   and sign in with your Apple Account (free, no paid developer membership needed).
+2. Download the newest **Game Porting Toolkit** `.dmg` (tested: 4.0 beta 2 and 3.0). You don't need to open or
+   install it.
+3. In Deadlock Launcher, click **Choose .dmg…** and pick the file. Or in Terminal (use your file's name):
+
+   ```sh
+   ~/Library/Application\ Support/deadlock-mac/bin/deadlock gptk ~/Downloads/Game_Porting_Toolkit_4.0.dmg
+   ```
+
+   It answers *DLSS enabled*. The `.dmg` can be deleted afterwards.
+4. Start the game and set the upscaler to **DLSS** in its video settings. **Performance** is a good start on a
+   MacBook Air; on faster Macs try Balanced or Quality.
 
 ## Rosetta or ARM64
 
