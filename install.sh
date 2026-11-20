@@ -65,7 +65,12 @@ fetch() {   # fetch <asset>: download (resumes) and verify
   if [[ -f $dl/$f && $(shasum -a 256 "$dl/$f" | cut -d' ' -f1) == $want ]]; then return 0; fi
   step "downloading $f"
   curl -fL --progress-bar -C - -o "$dl/$f" "$base/$f" || curl -fL --progress-bar -o "$dl/$f" "$base/$f" || die "download failed: $f"
-  [[ $(shasum -a 256 "$dl/$f" | cut -d' ' -f1) == $want ]] || { rm -f "$dl/$f"; die "$f: checksum mismatch, try again"; }
+  if [[ $(shasum -a 256 "$dl/$f" | cut -d' ' -f1) != $want ]]; then
+    # resuming only helps a cut-off download; a complete copy from an older build of this release must start over
+    rm -f "$dl/$f"
+    curl -fL --progress-bar -o "$dl/$f" "$base/$f" || die "download failed: $f"
+    [[ $(shasum -a 256 "$dl/$f" | cut -d' ' -f1) == $want ]] || { rm -f "$dl/$f"; die "$f: checksum mismatch, try again"; }
+  fi
 }
 
 # ---------------------------------------------------------------- scripts + launcher
@@ -101,7 +106,8 @@ install_runtime rosetta
 (( ARM64 )) && install_runtime arm64
 # keep only this release's small files (the runtimes are unpacked)
 for old in "$DL_ROOT"/cache/downloads/*(N/); do [[ ${old:t} == $VERSION ]] || rm -rf "$old"; done
-rm -f "$dl"/runtime-*.tar.xz
+leftovers=("$dl"/runtime-*.tar.xz(N))   # (N): none left is fine (re-running to update with current runtimes)
+(( $#leftovers )) && rm -f $leftovers
 
 # ---------------------------------------------------------------- Windows Steam
 if (( SETUP )); then
